@@ -1,0 +1,21 @@
+{
+    "num":2,
+    "name":"gjl",
+    "show_name":"高佳乐[青年]",
+    "speed":12.85,
+    "jump_speed":-20.12,
+    "attack":[473],
+    "stand_up":8,
+    "power":[15,10],
+    "skills":{
+        "normal":{"recovery":10.25,"hurt":[5]},
+        "skill_1":{
+            "cd":10,
+            "recovery":10
+        },
+        "skill_2":{
+            "cd":10,
+            "recovery":15
+        }
+    }
+}

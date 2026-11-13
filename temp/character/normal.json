@@ -1,0 +1,20 @@
+{
+    "num":0,
+    "name":"None",
+    "show_name":"测试",
+    "speed":10,
+    "jump_speed":-18,
+    "attack":[500],
+    "stand_up":10,
+    "skills":{
+        "normal":{"recovery":12,"hurt":["造成伤害的图片张数（数字）"]},
+        "skill":{
+            "cd":100,
+            "recovery":14
+        },
+        "skill_2":{
+            "cd":100,
+            "recovery":14
+        }
+    }
+}

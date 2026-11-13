@@ -1,0 +1,21 @@
+{
+    "num":3,
+    "name":"wyk",
+    "show_name":"王奕康[青年]",
+    "speed":13.63,
+    "jump_speed":-19.81,
+    "attack":[463,573,321],
+    "stand_up":5,
+    "power":[15,20],
+    "skills":{
+        "normal":{"recovery":9,"hurt":[3,5,4]},
+        "skill_1":{
+            "cd":12,
+            "recovery":10
+        },
+        "skill_2":{
+            "cd":10,
+            "recovery":15
+        }
+    }
+}

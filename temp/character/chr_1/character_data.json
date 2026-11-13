@@ -1,0 +1,21 @@
+{
+    "num":4,
+    "name":"chr_1",
+    "show_name":"陈浩然[国庆前夜]",
+    "speed":12.23,
+    "jump_speed":-20.21,
+    "attack":[583],
+    "stand_up":16,
+    "power":[15,25],
+    "skills":{
+        "normal":{"recovery":11.56,"hurt":[4]},
+        "skill_1":{
+            "cd":12,
+            "recovery":5
+        },
+        "skill_2":{
+            "cd":20,
+            "recovery":20
+        }
+    }
+}

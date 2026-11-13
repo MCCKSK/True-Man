@@ -1,0 +1,16 @@
+[
+	{
+		"num":1,
+		"name":"雾隐",
+		"description":"我可以存在任何地方......",
+		"cd":20,
+		"recovery":5
+	},
+	{
+		"num":2,
+		"name":"最后的晚餐",
+		"description":"你吃完晚饭了，现在是17:40",
+		"cd":20,
+		"recovery":5
+	}
+]

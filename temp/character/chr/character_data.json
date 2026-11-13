@@ -1,0 +1,21 @@
+{
+    "num":1,
+    "name":"chr",
+    "show_name":"陈浩然[青年]",
+    "speed":9.26,
+    "jump_speed":-18.21,
+    "attack":[546],
+    "stand_up":12,
+    "power":[10,25],
+    "skills":{
+        "normal":{"recovery":14.56,"hurt":[4]},
+        "skill_1":{
+            "cd":8,
+            "recovery":5
+        },
+        "skill_2":{
+            "cd":10,
+            "recovery":20
+        }
+    }
+}

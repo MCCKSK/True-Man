@@ -1,8 +1,0 @@
-Volume大量
-多样
-高速
-低价值
-
-B/S broswer/server
-C/S clinet/server
-

@@ -1235,7 +1235,7 @@ def get_chr1_orbit_book_positions(char, pos):
     _cx = pos[0]
     _cy = pos[1] - 40
     _R = CHR1_SKILL1_ORBIT_RADIUS
-    _base_ang = ui_frame_count * CHR1_SKILL1_ORBIT_SPEED
+    _base_ang = getattr(char, "chr1_orbit_books_age", 0) * CHR1_SKILL1_ORBIT_SPEED
     _result = []
     for _i in range(3):
         if not _alive[_i]:
@@ -1285,7 +1285,7 @@ def draw_chr1_orbit_books(surface, char, pos, side='all'):
     _cx = pos[0]
     _cy = pos[1] - 40
     _R = CHR1_SKILL1_ORBIT_RADIUS
-    _base_ang = ui_frame_count * CHR1_SKILL1_ORBIT_SPEED
+    _base_ang = getattr(char, "chr1_orbit_books_age", 0) * CHR1_SKILL1_ORBIT_SPEED
     _books = []
     for _i in range(3):
         if not _alive[_i]:
@@ -3995,14 +3995,14 @@ def build_network_state():
             "jump_phase": c.jump_phase,
             "vy": c.vy,
             "is_invincible": c.is_invincible,
-            "is_stand_up_invincible": c.is_stand_up_invincible,
+            "isu": c.is_stand_up_invincible,
             "extra_invis_active": c.extra_invis_active,
             "extra_invis_phase": c.extra_invis_phase,
             "extra_invis_timer": c.extra_invis_timer,
-            "extra_skill_2_active": c.extra_skill_2_active,
-            "extra_skill_2_phase": c.extra_skill_2_phase,
-            "extra_skill_2_timer": c.extra_skill_2_timer,
-            "damage_protection_total": c.damage_protection_total,
+            "s2a": c.extra_skill_2_active,
+            "s2p": c.extra_skill_2_phase,
+            "s2t": c.extra_skill_2_timer,
+            "dpt": c.damage_protection_total,
             "skill2_uses_left": c.skill2_uses_left,
             "pending_book_launch": c.pending_book_launch,
             "pending_skill2_launch": c.pending_skill2_launch,
@@ -4012,11 +4012,11 @@ def build_network_state():
             "cd_extra": c.skills['extra']['current_cd'],
             "active_anim": c.active_anim,
             # wyk 技能一：变身状态
-            "wyk_egg_transformed": c.wyk_egg_transformed,
+            "wet": c.wyk_egg_transformed,
             "wyk_egg_timer": c.wyk_egg_timer,
             "wyk_skill1_uses_left": c.wyk_skill1_uses_left,
             # wyk 技能二（声波）状态
-            "pending_wyk_skill2_launch": c.pending_wyk_skill2_launch,
+            "pw2l": c.pending_wyk_skill2_launch,
             "wyk_skill2_active": c.wyk_skill2_active,
             "wyk_skill2_timer": c.wyk_skill2_timer,
             # gjl 技能状态字段：让客户端能看到剩余次数和前摇/突进状态
@@ -4029,8 +4029,8 @@ def build_network_state():
             "gjl_skill2_origin_angle": c.gjl_skill2_origin_angle,
             "gjl_skill2_uses_left": c.gjl_skill2_uses_left,
             # 【音效】技能触发序号，客户端对比前后两帧识别技能触发
-            "skill1_trigger_seq": c.skill1_trigger_seq,
-            "skill2_trigger_seq": c.skill2_trigger_seq,
+            "s1q": c.skill1_trigger_seq,
+            "s2q": c.skill2_trigger_seq,
             # 隐藏技能：被控玩家是否正在冒白烟（客户端本地生成粒子）
             "wyk_hidden_smoke": c.wyk_hidden_smoke,
             # chr_1 技能一：环绕书剩余本数
@@ -4038,9 +4038,9 @@ def build_network_state():
             # 是否已激活环绕书效果
             "chr1_skill1_activated": c.chr1_skill1_activated,
             # 每本环绕书的存活状态（客户端绘制时需要）
-            "chr1_orbit_books_alive": list(c.chr1_orbit_books_alive),
+            "cbo": list(c.chr1_orbit_books_alive),
             # 环绕书累计存活帧数（用于客户端渐隐显示）
-            "chr1_orbit_books_age": c.chr1_orbit_books_age,
+            "cbog": c.chr1_orbit_books_age,
         }
     return {
         "c1": _cs(fight_chars[0]) if len(fight_chars) >= 1 else None,
@@ -4057,7 +4057,7 @@ def build_network_state():
                             "facing": w['facing'], "owner_index": w['owner_index']}
                            for w in skill2_2_projectiles],
         "dmgs": [{"x": int(n.x), "y": int(n.y), "d": n.damage, "a": n.alpha}
-                 for n in damage_numbers],
+                 for n in damage_numbers if n.alpha > 0],
         # 爆炸粒子和白烟是纯视觉细节，两端观感差别极难辨认，不通过网络同步；
         # 这样每次 STATE 包的体积能缩小 80% 以上，大幅降低主机序列化和
         # 客户端反序列化的 CPU 开销。客户端对应的列表会保持为空，
@@ -4155,7 +4155,7 @@ def apply_network_state(s):
         # 在本地生成烟雾特效。变回来自带伤害由主机负责，客户端只画。
         _ck_t = id(c)
         _old_trans = _client_last_transformed.get(_ck_t, False)
-        _new_trans = d.get("wyk_egg_transformed", False)
+        _new_trans = d.get("wet", False)
         if _new_trans != _old_trans:
             _tpos = char1_pos if _idx == 0 else char2_pos
             spawn_smoke(_tpos[0], _tpos[1])
@@ -4170,8 +4170,8 @@ def apply_network_state(s):
         # 【音效】客户端本地播放技能音效：
         # 对比相邻两帧 STATE 里 skill1/2_trigger_seq 是否增加，
         # 增加则说明技能刚被触发，本地播放对应音效。
-        _new_s1_seq = d.get("skill1_trigger_seq", 0)
-        _new_s2_seq = d.get("skill2_trigger_seq", 0)
+        _new_s1_seq = d.get("s1q", 0)
+        _new_s2_seq = d.get("s2q", 0)
         if _new_s1_seq > c.skill1_trigger_seq:
             play_sfx(c.name, 'skill_1')
         if _new_s2_seq > c.skill2_trigger_seq:
@@ -4206,14 +4206,14 @@ def apply_network_state(s):
         c.jump_phase = d["jump_phase"]
         c.vy = d["vy"]
         c.is_invincible = d["is_invincible"]
-        c.is_stand_up_invincible = d["is_stand_up_invincible"]
+        c.is_stand_up_invincible = d.get("isu", False)
         c.extra_invis_active = d["extra_invis_active"]
         c.extra_invis_phase = d["extra_invis_phase"]
         c.extra_invis_timer = d["extra_invis_timer"]
-        c.extra_skill_2_active = d.get("extra_skill_2_active", False)
-        c.extra_skill_2_phase = d.get("extra_skill_2_phase", 0)
-        c.extra_skill_2_timer = d.get("extra_skill_2_timer", 0)
-        c.damage_protection_total = d["damage_protection_total"]
+        c.extra_skill_2_active = d.get("s2a", False)
+        c.extra_skill_2_phase = d.get("s2p", 0)
+        c.extra_skill_2_timer = d.get("s2t", 0)
+        c.damage_protection_total = d.get("dpt", 0.0)
         c.skill2_uses_left = d["skill2_uses_left"]
         c.pending_book_launch = d["pending_book_launch"]
         c.pending_skill2_launch = d.get("pending_skill2_launch", 0)
@@ -4223,12 +4223,12 @@ def apply_network_state(s):
         c.skills['extra']['current_cd'] = d["cd_extra"]
         c.active_anim = d.get("active_anim", "stand")
         # wyk 技能一：同步变身状态
-        c.wyk_egg_transformed = d.get("wyk_egg_transformed", False)
+        c.wyk_egg_transformed = d.get("wet", False)
         c.wyk_egg_timer = d.get("wyk_egg_timer", 0)
         c.wyk_skill1_uses_left = d.get("wyk_skill1_uses_left",
                                        c.wyk_skill1_uses_left)
         # wyk 技能二（声波）状态同步
-        c.pending_wyk_skill2_launch = d.get("pending_wyk_skill2_launch", 0)
+        c.pending_wyk_skill2_launch = d.get("pw2l", 0)
         c.wyk_skill2_active = d.get("wyk_skill2_active", False)
         c.wyk_skill2_timer = d.get("wyk_skill2_timer", 0)
         # 客户端绘制应和主机保持一致：
@@ -4259,10 +4259,10 @@ def apply_network_state(s):
         c.chr1_skill1_activated = d.get("chr1_skill1_activated",
                                         c.chr1_skill1_activated)
         # 每本环绕书的存活状态
-        _orb_alive = d.get("chr1_orbit_books_alive", None)
+        _orb_alive = d.get("cbo", None)
         if _orb_alive is not None and len(_orb_alive) == 3:
             c.chr1_orbit_books_alive = [bool(_x) for _x in _orb_alive]
-        c.chr1_orbit_books_age = d.get("chr1_orbit_books_age", 0)
+        c.chr1_orbit_books_age = d.get("cbog", 0)
     # 角色名校验：主机发来的 name 和本地不一致时，按主机的 name
     # 重建本地角色对象。否则后续所有状态（hp / 动画 / 位置）都会
     # 套到错误的角色上，表现为"跳成其他角色 / 抽搐"。
@@ -5011,7 +5011,11 @@ def draw_client_fight_view(mouse_pos):
         # 与主机端完全一致：金色文字 + 脉冲放大动画
         _ko_pulse = 1.0 + 0.10 * math.sin(ko_timer * 0.15)
         _ko_font = get_font(56)
-        _ko_txt = _ko_font.render(_ko_text, True, (255, 215, 0))
+        if _ko_text == "你失败了":
+            _ko_color = (150, 150, 150)
+        else:
+            _ko_color = (255, 215, 0)
+        _ko_txt = _ko_font.render(_ko_text, True, _ko_color)
         _ko_shadow = _ko_font.render(_ko_text, True, (0, 0, 0))
         _ko_w = max(1, int(_ko_txt.get_width() * _ko_pulse))
         _ko_h = max(1, int(_ko_txt.get_height() * _ko_pulse))
@@ -6136,26 +6140,14 @@ while running:
                 btn_back.rect.center = (W // 2, H - 100)
                 if btn_back.clicked(mouse_pos, event):
                     if network_connected:
-                        # 联机：点击 back 只算“本机已确认”。
-                        # 主机负责判定：双方都确认后才切回准备页。
-                        if not network_ko_back_local:
-                            network_ko_back_local = True
-                            try:
-                                net_send_to_peer("KO_BACK")
-                            except Exception:
-                                pass
-                        if network_role == "host" and network_ko_back_remote:
-                            try:
-                                net_send_to_peer("BACK_TO_READY")
-                            except Exception:
-                                pass
-                            STATE = LAN_READY
-                            network_local_ready = False
-                            network_remote_ready = False
-                            ko_phase = 0
-                            ko_timer = 0
-                            network_ko_back_local = False
-                            network_ko_back_remote = False
+                        # 联机：谁点 back 谁就退出到准备界面，对对方无影响
+                        STATE = LAN_READY
+                        network_local_ready = False
+                        network_remote_ready = False
+                        ko_phase = 0
+                        ko_timer = 0
+                        network_ko_back_local = False
+                        network_ko_back_remote = False
                     else:
                         STATE = MENU
                         fight_chars = []
@@ -8692,55 +8684,7 @@ while running:
                         _atk.chr1_book_hit_count += 1
                         chr1_track_books.remove(_p)
 
-            # ===== chr_1 自动二技能状态机 =====
-            # 触发条件：chr_1 的对手处于倒地 / 被击飞状态，
-            # 且 chr_1 的 book 击中对手累计达到阈值。
-            # 触发后进入 2 秒爆发：每 N 帧发射一轮散射书，
-            # 不扣存储次数、不检查 CD、也不改变 CD。
-            for _ai in range(min(len(fight_chars), 2)):
-                _own = fight_chars[_ai]
-                if _own.name != 'chr_1':
-                    continue
-                _opp = fight_chars[1 - _ai]
-                _opp_downed = (_opp.is_hit or _opp.is_standing_up)
-                if not _opp_downed:
-                    # 对方已起立 -> 清空计数并终止爆发
-                    _own.chr1_book_hit_count = 0
-                    _own.chr1_auto_skill2_active = False
-                    _own.chr1_auto_skill2_timer = 0
-                    _own.chr1_auto_skill2_interval_timer = 0
-                    continue
-                if (not _own.chr1_auto_skill2_active
-                        and not _own.chr1_auto_skill2_used
-                        and _own.chr1_book_hit_count >= CHR1_AUTO_SKILL2_TRIGGER_HITS):
-                    _own.chr1_auto_skill2_active = True
-                    _own.chr1_auto_skill2_used = True
-                    _own.chr1_auto_skill2_timer = CHR1_AUTO_SKILL2_DURATION_FRAMES
-                    _own.chr1_auto_skill2_interval_timer = 0
-                    _own.chr1_book_hit_count = 0
-                if _own.chr1_auto_skill2_active:
-                    _own.chr1_auto_skill2_timer -= 1
-                    _own.chr1_auto_skill2_interval_timer -= 1
-                    if _own.chr1_auto_skill2_interval_timer <= 0:
-                        _own.chr1_auto_skill2_interval_timer = CHR1_AUTO_SKILL2_INTERVAL
-                        _apos = char1_pos if _ai == 0 else char2_pos
-                        _base_ang = 0.0 if _own.facing == 'right' else math.pi
-                        _sx = float(_apos[0])
-                        _sy = float(_apos[1] - 60)
-                        for _kk in range(CHR1_SKILL2_BOOK_COUNT):
-                            _aa = _base_ang + _kk * (2.0 * math.pi / CHR1_SKILL2_BOOK_COUNT)
-                            chr1_skill2_books.append({
-                                'owner_index': _ai,
-                                'x': _sx,
-                                'y': _sy,
-                                'angle': _aa,
-                                'angular_speed': CHR1_SKILL2_ANGULAR_SPEED,
-                                'damage': CHR1_SKILL2_DAMAGE,
-                                'age': 0,
-                            })
-                    if _own.chr1_auto_skill2_timer <= 0:
-                        _own.chr1_auto_skill2_active = False
-                        _own.chr1_auto_skill2_timer = 0
+            # chr_1 自动二技能已删除
 
             # ===== chr_1 技能二：旋转散射书更新与碰撞 =====
             # 每帧角度加上角速度，位置按新角度前进，形成螺旋/旋涡轨迹。
@@ -9760,6 +9704,13 @@ while running:
         # night 地图：在角色和血溅之上，结算界面之下盖一层 cover.png
         draw_night_cover()
 
+        # 伤害数字：KO 后继续更新并绘制，让它们正常淡出消失
+        for num in damage_numbers[:]:
+            num.update()
+            num.draw(screen)
+            if num.is_dead():
+                damage_numbers.remove(num)
+
         # 世界绘制结束：按相机偏移 blit 到真正的屏幕
         screen = _cam_real_screen
         screen.fill((0, 0, 0))
@@ -9769,24 +9720,14 @@ while running:
         # 仍需要双方都确认才切回准备页（由主机判定）。
         if ko_timer >= KO_ANIM_FRAMES + 180:
             if network_connected:
-                if not network_ko_back_local:
-                    network_ko_back_local = True
-                    try:
-                        net_send_to_peer("KO_BACK")
-                    except Exception:
-                        pass
-                if network_role == "host" and network_ko_back_remote:
-                    try:
-                        net_send_to_peer("BACK_TO_READY")
-                    except Exception:
-                        pass
-                    STATE = LAN_READY
-                    network_local_ready = False
-                    network_remote_ready = False
-                    ko_phase = 0
-                    ko_timer = 0
-                    network_ko_back_local = False
-                    network_ko_back_remote = False
+                # 超时：本机自己退出到准备界面，对对方无影响
+                STATE = LAN_READY
+                network_local_ready = False
+                network_remote_ready = False
+                ko_phase = 0
+                ko_timer = 0
+                network_ko_back_local = False
+                network_ko_back_remote = False
             else:
                 STATE = MENU
                 fight_chars = []
@@ -9847,7 +9788,11 @@ while running:
                 text = f"{winner_side} {winner_show_name} 获胜"
 
             base_font = get_font(56)
-            txt_surf = base_font.render(text, True, (255, 215, 0))
+            if network_connected and text == "你失败了":
+                _txt_color = (150, 150, 150)
+            else:
+                _txt_color = (255, 215, 0)
+            txt_surf = base_font.render(text, True, _txt_color)
             shadow_surf = base_font.render(text, True, (0, 0, 0))
 
             new_w = max(1, int(txt_surf.get_width() * pulse))

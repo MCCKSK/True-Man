@@ -1,1 +1,0 @@
-C:\Users\123\AppData\Local\Programs\Python\Python315\Scripts\pyinstaller.exe main.py -w -i icon.ico

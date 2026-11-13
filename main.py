@@ -7,6 +7,12 @@ import math
 import re
 import socket
 import collections
+import threading
+import tempfile
+import zipfile
+import subprocess
+import urllib.request
+import shutil
 
 # 使用自定义字典维护按键状态，解决 Pygame 2.x 键码错位及拖动窗口卡键问题
 _custom_key_state = collections.defaultdict(bool)
@@ -3292,6 +3298,7 @@ btn_two = Button(make_text_button("双人"), (400, 300))
 btn_single = Button(make_text_button("训练"), (400, 400))
 btn_about = Button(make_text_button("关于"), (400, 500))
 btn_keys = Button(make_text_button("键位"), (400, 200))
+btn_check_update = Button(make_text_button("检查更新", size=(150, 40), bg=(60, 60, 90), font_size=20), (W - 90, H - 30))
 btn_back = Button(make_text_button("BACK", size=(80, 40), bg=(60, 60, 90), font_size=22), (60, 35))
 btn_exit_room = Button(make_text_button("退出房间", size=(140, 44), bg=(120, 60, 60), font_size=22), (85, 35))
 btn_ok = Button(make_text_button("确定", size=(100, 50), bg=(60, 60, 90), font_size=24), (690, 540), active=False)
@@ -5041,10 +5048,230 @@ def draw_client_fight_view(mouse_pos):
         _oy = random.randint(-SKILL2_2_SHAKE_OFFSET, SKILL2_2_SHAKE_OFFSET)
         screen.blit(_shk_surf, (_ox, _oy))
 
+# ---------- 自动更新 ----------
+UPDATE_REPO = "MCCKSK/True-Man"
+update_lock = threading.Lock()
+update_popup = None
+update_pending_zip_url = None
+update_ready_to_exit = False
+
+
+def _github_latest_release():
+    """请求 GitHub 最新 Release，返回 (tag_name, zip_url)。
+    找不到 zip 时 zip_url 为 None；网络失败抛异常。"""
+    url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "TrueMan-Updater",
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    tag = (data.get("tag_name") or "").strip()
+    zip_url = None
+    for asset in data.get("assets", []):
+        name = asset.get("name", "")
+        if name.lower().startswith("trueman") and name.lower().endswith(".zip"):
+            zip_url = asset.get("browser_download_url")
+            break
+    return tag, zip_url
+
+
+def _strip_v(tag):
+    if tag and tag[0] in ("v", "V"):
+        return tag[1:]
+    return tag
+
+
+def check_update_thread(silent):
+    """检查更新。silent=True 时不弹提示（启动静默检查）。"""
+    global update_popup
+    try:
+        tag, zip_url = _github_latest_release()
+    except Exception as e:
+        if not silent:
+            with update_lock:
+                update_popup = {"type": "check_fail", "msg": f"检查更新失败：{e}"}
+        return
+    remote_ver = _strip_v(tag)
+    if not remote_ver:
+        if not silent:
+            with update_lock:
+                update_popup = {"type": "check_fail", "msg": "未获取到版本号"}
+        return
+    if not zip_url:
+        if not silent:
+            with update_lock:
+                update_popup = {"type": "check_fail", "msg": "Release 中没有找到 zip 文件"}
+        return
+    if compare_version(remote_ver, ver) > 0:
+        with update_lock:
+            update_popup = {"type": "prompt", "version": remote_ver, "current": ver, "zip_url": zip_url}
+    else:
+        if not silent:
+            with update_lock:
+                update_popup = {"type": "check_fail", "msg": f"已是最新版本 {ver}"}
+
+
+def download_and_apply_thread(zip_url):
+    """下载 zip -> 解压到临时目录 -> 写 bat -> 启动 bat -> 通知主循环退出。"""
+    global update_popup, update_pending_zip_url, update_ready_to_exit
+    update_pending_zip_url = zip_url
+    if not getattr(sys, "frozen", False):
+        with update_lock:
+            update_popup = {"type": "download_fail", "msg": "当前为源码运行，自动更新仅限 exe 版，请手动下载"}
+        return
+    try:
+        game_dir = os.path.dirname(os.path.abspath(sys.executable))
+        exe_name = os.path.basename(sys.executable)
+        temp_dir = tempfile.mkdtemp(prefix="trueman_update_")
+        zip_path = os.path.join(temp_dir, "update.zip")
+        req = urllib.request.Request(zip_url, headers={"User-Agent": "TrueMan-Updater"})
+        with urllib.request.urlopen(req, timeout=120) as r, open(zip_path, "wb") as f:
+            shutil.copyfileobj(r, f)
+        extract_dir = os.path.join(temp_dir, "extract")
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(extract_dir)
+        entries = os.listdir(extract_dir)
+        if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
+            source_dir = os.path.join(extract_dir, entries[0])
+        else:
+            source_dir = extract_dir
+        if not os.path.exists(os.path.join(source_dir, exe_name)):
+            for _f in os.listdir(source_dir):
+                if _f.lower().endswith(".exe"):
+                    exe_name = _f
+                    break
+        bat_path = os.path.join(temp_dir, "update.bat")
+        with open(bat_path, "w", encoding="gbk", errors="replace") as f:
+            f.write("@echo off\n")
+            f.write("chcp 936 >nul\n")
+            f.write("timeout /t 3 /nobreak >nul\n")
+            f.write(f'cd /d "{game_dir}"\n')
+            f.write(f'del /f /s /q "{game_dir}\\*.*" 2>nul\n')
+            f.write(f'for /d %%D in ("{game_dir}\\*") do rd /s /q "%%D" 2>nul\n')
+            f.write(f'xcopy /e /y /i /q "{source_dir}\\*" "{game_dir}\\" >nul\n')
+            f.write(f'start "" "{os.path.join(game_dir, exe_name)}"\n')
+            f.write(f'del /f /q "{zip_path}" 2>nul\n')
+            f.write(f'rd /s /q "{extract_dir}" 2>nul\n')
+        subprocess.Popen(["cmd", "/c", bat_path],
+                         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                         close_fds=True)
+        update_ready_to_exit = True
+    except Exception as e:
+        with update_lock:
+            update_popup = {"type": "download_fail", "msg": f"更新失败：{e}"}
+
+
+def _draw_popup_button(text, rect, mouse_pos):
+    _hover = rect.collidepoint(mouse_pos)
+    _bg = (90, 90, 140) if _hover else (60, 60, 100)
+    pygame.draw.rect(screen, _bg, rect)
+    pygame.draw.rect(screen, (220, 220, 220), rect, 2)
+    _f = get_font(22)
+    _t = _f.render(text, True, (255, 255, 255))
+    _sh = _f.render(text, True, (0, 0, 0))
+    _r = _t.get_rect(center=rect.center)
+    for _dx, _dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+        screen.blit(_sh, (_r.x + _dx, _r.y + _dy))
+    screen.blit(_t, _r)
+
+
+def _draw_update_popup(mouse_pos):
+    """绘制自动更新弹窗（覆盖在最上层）。"""
+    with update_lock:
+        popup = update_popup
+    if popup is None:
+        return
+    _ov = pygame.Surface((W, H), pygame.SRCALPHA)
+    _ov.fill((0, 0, 0, 160))
+    screen.blit(_ov, (0, 0))
+    box_w, box_h = 500, 280
+    box_x = (W - box_w) // 2
+    box_y = (H - box_h) // 2
+    pygame.draw.rect(screen, (40, 40, 55), (box_x, box_y, box_w, box_h))
+    pygame.draw.rect(screen, (220, 220, 220), (box_x, box_y, box_w, box_h), 3)
+    ptype = popup.get("type")
+    btn_l = pygame.Rect(box_x + 60, box_y + box_h - 80, 160, 50)
+    btn_r = pygame.Rect(box_x + box_w - 220, box_y + box_h - 80, 160, 50)
+    if ptype == "checking":
+        bordered_text("正在检查更新...", (W // 2, box_y + box_h // 2), "center", size=28)
+    elif ptype == "prompt":
+        bordered_text(f"发现新版本 {popup.get('version', '')}", (W // 2, box_y + 60), "center", size=28)
+        bordered_text(f"当前版本 {popup.get('current', '')}", (W // 2, box_y + 105), "center", size=22)
+        bordered_text("对应配置需要在更新后重置", (W // 2, box_y + 145), "center", size=18)
+        _draw_popup_button("更新", btn_l, mouse_pos)
+        _draw_popup_button("跳过", btn_r, mouse_pos)
+    elif ptype in ("check_fail", "download_fail"):
+        title = "检查更新失败" if ptype == "check_fail" else "更新失败"
+        bordered_text(title, (W // 2, box_y + 60), "center", size=28)
+        msg = popup.get("msg", "") or ""
+        _f = get_font(16)
+        _lines = []
+        _cur = ""
+        for _ch in msg:
+            if _f.size(_cur + _ch)[0] > box_w - 60 and _cur:
+                _lines.append(_cur)
+                _cur = _ch
+            else:
+                _cur += _ch
+        if _cur:
+            _lines.append(_cur)
+        _lines = _lines[:3]
+        for _i, _ln in enumerate(_lines):
+            bordered_text(_ln, (W // 2, box_y + 105 + _i * 24), "center", size=16)
+        _draw_popup_button("重试", btn_l, mouse_pos)
+        _draw_popup_button("取消", btn_r, mouse_pos)
+    elif ptype == "downloading":
+        bordered_text("正在下载更新...", (W // 2, box_y + box_h // 2 - 20), "center", size=28)
+        bordered_text("下载完成后程序会自动重启，请勿关闭窗口", (W // 2, box_y + box_h // 2 + 25), "center", size=16)
+
+
+def _handle_update_popup_event(mouse_pos, event):
+    global update_popup
+    if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+        return
+    with update_lock:
+        popup = update_popup
+    if popup is None:
+        return
+    box_w, box_h = 500, 280
+    box_x = (W - box_w) // 2
+    box_y = (H - box_h) // 2
+    btn_l = pygame.Rect(box_x + 60, box_y + box_h - 80, 160, 50)
+    btn_r = pygame.Rect(box_x + box_w - 220, box_y + box_h - 80, 160, 50)
+    ptype = popup.get("type")
+    if ptype == "prompt":
+        if btn_l.collidepoint(mouse_pos):
+            with update_lock:
+                update_popup = {"type": "downloading"}
+            threading.Thread(target=download_and_apply_thread,
+                             args=(popup["zip_url"],), daemon=True).start()
+        elif btn_r.collidepoint(mouse_pos):
+            with update_lock:
+                update_popup = None
+    elif ptype in ("check_fail", "download_fail"):
+        if btn_l.collidepoint(mouse_pos):
+            if ptype == "check_fail":
+                with update_lock:
+                    update_popup = {"type": "checking"}
+                threading.Thread(target=check_update_thread, args=(False,), daemon=True).start()
+            elif update_pending_zip_url:
+                with update_lock:
+                    update_popup = {"type": "downloading"}
+                threading.Thread(target=download_and_apply_thread,
+                                 args=(update_pending_zip_url,), daemon=True).start()
+        elif btn_r.collidepoint(mouse_pos):
+            with update_lock:
+                update_popup = None
+
+
 # ---------- 主循环 ----------
 running = True
 cloud_x = 0
 frame_count = 0
+# 启动时静默检查一次更新
+threading.Thread(target=check_update_thread, args=(True,), daemon=True).start()
 while running:
     ui_frame_count += 1
 
@@ -5115,6 +5342,12 @@ while running:
         if event.type == pygame.QUIT:
             running = False
             continue
+        # 自动更新弹窗打开时，优先处理并屏蔽其他输入
+        with update_lock:
+            _popup_now = update_popup
+        if _popup_now is not None:
+            _handle_update_popup_event(mouse_pos, event)
+            continue
         # 记录按键状态
         if event.type == pygame.KEYDOWN:
             _custom_key_state[event.key] = True
@@ -5170,6 +5403,14 @@ while running:
             if btn_keys is not None and btn_keys.clicked(mouse_pos, event):
                 STATE = KEYS
                 keys_editing_idx = -1
+                break
+            if btn_check_update.clicked(mouse_pos, event):
+                with update_lock:
+                    _start_check = update_popup is None
+                    if _start_check:
+                        update_popup = {"type": "checking"}
+                if _start_check:
+                    threading.Thread(target=check_update_thread, args=(False,), daemon=True).start()
                 break
 
         elif STATE == SINGLE_SELECT:
@@ -6331,6 +6572,8 @@ while running:
         btn_about.draw(mouse_pos)
         if btn_keys is not None:
             btn_keys.draw(mouse_pos)
+        btn_check_update.draw(mouse_pos)
+        _draw_update_popup(mouse_pos)
 
     elif STATE == ABOUT:
         screen.fill((0, 0, 0))
@@ -9826,6 +10069,11 @@ while running:
 
     pygame.display.flip()
     clock.tick(FPS)
+
+    # 自动更新：下载线程完成后立即退出，让 update.bat 完成替换
+    if update_ready_to_exit:
+        pygame.quit()
+        sys.exit(0)
 
 pygame.quit()
 sys.exit()

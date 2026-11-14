@@ -5834,9 +5834,43 @@ def _strip_v(tag):
     return tag
 
 
+def _read_custom_update_url():
+    """从 GitHub raw 地址读取 link.txt 中的自定义直链。
+    link.txt 只放一行下载地址；版本号从地址文件名中提取。
+    读取失败、内容无效或无法提取版本号时返回 None，由调用方回退到 GitHub Release。"""
+    _link_url = "https://raw.githubusercontent.com/MCCKSK/True-Man/main/link.txt"
+    try:
+        _req = urllib.request.Request(
+            _link_url, headers={"User-Agent": "TrueMan-Updater"})
+        with urllib.request.urlopen(_req, timeout=8) as _resp:
+            _body = _resp.read().decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return None
+    if not _body:
+        return None
+    if not (_body.startswith("http://") or _body.startswith("https://")):
+        return None
+    _ver = ""
+    _m = re.search(r'[vV]?(\d+\.\d+\.\d+[\w.\-]*)', _body)
+    if _m:
+        _ver = _m.group(1)
+    if not _ver:
+        return None
+    return _body, _ver
+
+
 def check_update_thread(silent):
     """检查更新。silent=True 时不弹提示（启动静默检查）。"""
     global update_popup
+    # 优先使用 link.txt 中配置的直链
+    _custom = _read_custom_update_url()
+    if _custom is not None:
+        _custom_url, _custom_ver = _custom
+        if compare_version(_custom_ver, ver) > 0:
+            with update_lock:
+                update_popup = {"type": "prompt", "version": _custom_ver,
+                                "current": ver, "zip_url": _custom_url}
+            return
     try:
         tag, zip_url = _github_latest_release()
     except Exception as e:
@@ -5880,20 +5914,24 @@ def download_and_apply_thread(zip_url, new_version=None):
         temp_dir = tempfile.mkdtemp(prefix="trueman_update_")
         zip_path = os.path.join(temp_dir, "update.zip")
         
-        # 纯 Python 多线程分段并行下载，无黑窗，防卡死
-        _proxies = [
-            "", # 原链接
-            "https://ghproxy.net/",
-            "https://ghfast.top/",
-            "https://gh.llkk.cc/",
-        ]
-        _urls_to_try = []
-        _clean_url = zip_url.replace("https://github.com/", "")
-        for _p in _proxies:
-            _urls_to_try.append(_p + zip_url)
-            if _p:
-                _urls_to_try.append(_p + _clean_url)
-        _urls_to_try = list(dict.fromkeys(_urls_to_try))
+        # 只有 GitHub 域名的链接才拼代理；其他直链直接用原地址
+        if ("github.com" in zip_url) or ("githubusercontent.com" in zip_url):
+            _proxies = [
+                "",
+                "https://gh-proxy.com/",
+                "https://ghproxy.net/",
+                "https://ghfast.top/",
+                "https://gh.llkk.cc/",
+            ]
+            _urls_to_try = []
+            _clean_url = zip_url.replace("https://github.com/", "")
+            for _p in _proxies:
+                _urls_to_try.append(_p + zip_url)
+                if _p:
+                    _urls_to_try.append(_p + _clean_url)
+            _urls_to_try = list(dict.fromkeys(_urls_to_try))
+        else:
+            _urls_to_try = [zip_url]
         
         _success = False
         _last_err = ""

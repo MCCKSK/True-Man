@@ -6299,6 +6299,42 @@ def _handle_update_popup_event(mouse_pos, event):
                 update_popup = None
 
 
+# ---------- 退出前彻底清理 ----------
+def _final_cleanup():
+    """程序退出前释放音频设备、socket、pygame 资源，
+    避免进程在窗口消失后仍然残留，导致 exe 被锁定无法删除。"""
+    global voice_running
+    try:
+        voice_running = False
+    except Exception:
+        pass
+    for _t in (voice_send_thread, voice_recv_thread):
+        try:
+            if _t is not None and _t.is_alive():
+                _t.join(timeout=0.5)
+        except Exception:
+            pass
+    try:
+        _voice_release_udp()
+    except Exception:
+        pass
+    for _sk in (network_client_sock, network_sock):
+        try:
+            if _sk is not None:
+                _sk.close()
+        except Exception:
+            pass
+    try:
+        if pygame.mixer.get_init():
+            pygame.mixer.quit()
+    except Exception:
+        pass
+    try:
+        pygame.quit()
+    except Exception:
+        pass
+
+
 # ---------- 主循环 ----------
 running = True
 cloud_x = 0
@@ -11233,8 +11269,8 @@ while running:
 
     # 自动更新：下载线程完成后立即退出，让 update.bat 完成替换
     if update_ready_to_exit:
-        pygame.quit()
+        _final_cleanup()
         sys.exit(0)
 
-pygame.quit()
+_final_cleanup()
 sys.exit()

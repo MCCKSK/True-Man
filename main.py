@@ -158,6 +158,7 @@ SKILL_SELECT_1P = 11
 SKILL_SELECT_2P = 12
 SOLO_SETTINGS = 18     # 单人模式的战斗中设置（换角色/携带技能/地图）
 KEYS = 19              # 按键设置页面
+HELP = 20              # 帮助页面
 
 # 局域网联机状态
 LAN_SELECT = 13        # 局域网子菜单：创建房间 / 加入房间
@@ -772,6 +773,19 @@ def net_cleanup():
     global network_ver_sent
     global network_host_is_1p, network_is_1p
     global network_ko_back_local, network_ko_back_remote
+    global voice_state, voice_dialog, voice_dialog_timer
+    global voice_pending_port, voice_volume_panel_open, voice_volume_dragging
+    # 断开联机时同步关闭语音通话
+    try:
+        _voice_stop_call()
+    except NameError:
+        pass
+    voice_state = 'off'
+    voice_dialog = None
+    voice_dialog_timer = 0
+    voice_pending_port = 0
+    voice_volume_panel_open = False
+    voice_volume_dragging = False
     try:
         net_send_to_peer("BYE")
     except Exception:
@@ -817,6 +831,8 @@ def net_handle_message(msg):
     global STATE, network_local_ready, ko_phase, ko_timer
     global network_host_is_1p, network_is_1p, selected_idx
     global network_ko_back_local, network_ko_back_remote
+    global voice_state, voice_dialog, voice_dialog_timer
+    global voice_pending_port
     if msg == "KO_BACK":
         # 对方在 KO 结算界面点击了 back。
         # 只是标记对方已确认，不立即切状态。
@@ -907,6 +923,34 @@ def net_handle_message(msg):
                 emoji_show_side = _side
                 emoji_show_img = emoji_images[_num]
                 emoji_show_timer = 300  # 5 秒
+    elif msg.startswith("VOICE_REQ:"):
+        # 对方申请开启语音，附带对方的 UDP 端口
+        try:
+            _pport = int(msg.split(":", 1)[1])
+        except Exception:
+            _pport = 0
+        if voice_state == 'off' and _pport > 0:
+            voice_pending_port = _pport
+            voice_dialog = 'remote_request'
+    elif msg.startswith("VOICE_ACCEPT:"):
+        # 对方同意开启语音，附带对方的 UDP 端口
+        try:
+            _pport = int(msg.split(":", 1)[1])
+        except Exception:
+            _pport = 0
+        if voice_state == 'pending' and _pport > 0:
+            _voice_start_call(_pport, is_initiator=True)
+    elif msg.startswith("VOICE_REJECT"):
+        # 对方拒绝或取消申请
+        if voice_state == 'pending':
+            voice_state = 'off'
+            _voice_release_udp()
+    elif msg.startswith("VOICE_CLOSE"):
+        # 对方主动关闭语音通话
+        if voice_state == 'on':
+            _voice_stop_call()
+            voice_dialog = 'closed_by_peer'
+            voice_dialog_timer = int(3.0 * FPS)
     elif msg.startswith("INPUT:"):
         try:
             network_remote_input = json.loads(msg.split(":", 1)[1])
@@ -1140,25 +1184,21 @@ def calc_egg_velocity(sx, sy, tx, ty):
 
 
 def spawn_skill2_2_weapon(owner_idx, facing):
-    """生成技能 2 的武器。从屏幕边缘滑入，而不是在使用者身上突然出现。
-    面向右时武器从屏幕左边缘外面滑入、向右滑过整个屏幕；
-    面向左时武器从屏幕右边缘外面滑入、向左滑过整个屏幕。
-    初始位置放在屏幕外面（-bw 或 W+bw），保证有一段明显的
-    从屏幕外平滑滑入的过程。"""
+    """生成技能 2 的武器。从屏幕边缘滑入，而不是在使用者身上突然出现。"""
     if len(fight_chars) <= owner_idx:
         return
     owner = fight_chars[owner_idx]
     y = owner.ground_y - 60
+    owner_pos = char1_pos if owner_idx == 0 else char2_pos
+    target_x = float(owner_pos[0])
     if skill2_2_img is not None:
         bw = skill2_2_img.get_width()
     else:
         bw = 80
     if facing == 'right':
-        # 面向右：从屏幕左边缘外面滑入
         x = -float(bw)
         vx = SKILL2_2_WEAPON_SPEED
     else:
-        # 面向左：从屏幕右边缘外面滑入
         x = float(MAP_W) + float(bw)
         vx = -SKILL2_2_WEAPON_SPEED
     skill2_2_projectiles.append({
@@ -1169,6 +1209,9 @@ def spawn_skill2_2_weapon(owner_idx, facing):
         'y': y,
         'vx': vx,
         'last_hit_frame': -999,
+        'target_x': target_x,
+        'fading': False,
+        'alpha': 255,
     })
 
 def update_extra_skill2_state(char, owner_idx):
@@ -1270,6 +1313,49 @@ def get_chr1_orbit_book_positions(char, pos):
         _result.append((_i, _x, _y))
     return _result
 
+
+def draw_high_stamina_particles(surface, char, pos, side='all'):
+    # 雾隐（携带技能一）期间不绘制任何体力粒子
+    if char.extra_invis_active:
+        return
+    if char.stamina < char.max_stamina * 0.8:
+        return
+    _cx = pos[0]
+    _cy = pos[1] - 40
+    _R = 80
+    _N = 18
+    # 整体旋转相位：让所有粒子绕角色持续旋转
+    _base_ang = ui_frame_count * 0.035
+    _points = []
+    for _i in range(_N):
+        # 球面均匀分布：纬度 + 黄金角经度，避免粒子挤成一条线
+        _lat = math.acos(1.0 - 2.0 * (_i + 0.5) / _N)
+        _lon = _base_ang + _i * 2.399963
+        _sl = math.sin(_lat)
+        _x = _cx + _R * _sl * math.cos(_lon)
+        _y = _cy - _R * math.cos(_lat) * 0.65
+        _z = _sl * math.sin(_lon)
+        # 每个粒子独立生命相位：渐显 -> 最亮 -> 渐隐
+        _life = (ui_frame_count * 0.008 + _i * 0.37) % 1.0
+        _ar = math.sin(_life * math.pi)
+        if _ar < 0.06:
+            continue
+        _points.append((_x, _y, _z, _ar))
+    _points.sort(key=lambda t: t[2])
+    if side == 'behind':
+        _points = [p for p in _points if p[2] < 0]
+    elif side == 'front':
+        _points = [p for p in _points if p[2] >= 0]
+    for _x, _y, _z, _ar in _points:
+        # 粒子尺寸 1~3 像素，比原版更小
+        _size = max(1, int(3 * _ar + 0.5))
+        _alpha = int(255 * _ar)
+        if _alpha < 0:
+            _alpha = 0
+        elif _alpha > 255:
+            _alpha = 255
+        surface.blit(get_smoke_surf(_size, _alpha),
+                     (int(_x - _size), int(_y - _size)))
 
 def draw_chr1_orbit_books(surface, char, pos, side='all'):
     """绘制 chr_1 周围环绕的书。三本书分别位于 XY / YZ / XZ 三个 3D 平面，
@@ -1514,6 +1600,435 @@ def _show_connecting_overlay(ip_text, port):
         pygame.event.clear()
     except Exception:
         pass
+
+# ---------- 局域网语音通话辅助函数 ----------
+def _voice_release_udp():
+    """释放语音 UDP 套接字。"""
+    global voice_udp_sock, voice_peer_udp_addr
+    if voice_udp_sock is not None:
+        try:
+            voice_udp_sock.close()
+        except Exception:
+            pass
+    voice_udp_sock = None
+    voice_peer_udp_addr = None
+
+def _voice_peer_tcp_addr():
+    """取 TCP 对端的 IP。主机返回 client 地址，客户端返回 host 地址。"""
+    try:
+        if network_role == "host" and network_client_sock is not None:
+            return network_client_sock.getpeername()[0]
+        if network_role == "client" and network_sock is not None:
+            return network_sock.getpeername()[0]
+    except Exception:
+        pass
+    return None
+
+def _voice_send_loop():
+    """后台线程：采集麦克风数据并发送到对方 UDP 端口。"""
+    global voice_running
+    try:
+        _in = _sounddevice.RawInputStream(
+            samplerate=VOICE_SR, channels=1, dtype='int16',
+            blocksize=VOICE_BLOCK)
+        _in.start()
+    except Exception:
+        voice_running = False
+        return
+    while voice_running:
+        try:
+            _data, _ = _in.read(VOICE_BLOCK)
+        except Exception:
+            break
+        _sock = voice_udp_sock
+        _addr = voice_peer_udp_addr
+        if _sock is not None and _addr is not None:
+            try:
+                _sock.sendto(bytes(_data), _addr)
+            except Exception:
+                pass
+    try:
+        _in.stop()
+        _in.close()
+    except Exception:
+        pass
+
+def _voice_recv_loop():
+    """后台线程：从 UDP 接收对方音频并播放。"""
+    global voice_running
+    try:
+        _out = _sounddevice.RawOutputStream(
+            samplerate=VOICE_SR, channels=1, dtype='int16',
+            blocksize=VOICE_BLOCK)
+        _out.start()
+    except Exception:
+        voice_running = False
+        return
+    _sock = voice_udp_sock
+    while voice_running and _sock is not None:
+        try:
+            _sock.settimeout(0.1)
+            _data, _ = _sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        except Exception:
+            break
+        if _data:
+            try:
+                if voice_volume != 1.0:
+                    _arr = _np.frombuffer(_data, dtype=_np.int16).astype(_np.float32)
+                    _arr = _np.clip(_arr * voice_volume, -32768, 32767).astype(_np.int16)
+                    _data = _arr.tobytes()
+                _out.write(_data)
+            except Exception:
+                pass
+    try:
+        _out.stop()
+        _out.close()
+    except Exception:
+        pass
+
+def _voice_start_call(peer_port, is_initiator):
+    """开启语音通话。
+    is_initiator=True：本机发起申请，UDP 已在 _voice_request_start 绑定；
+    is_initiator=False：本机为接收方，需要新建 UDP 并发送 ACCEPT。"""
+    global voice_udp_sock, voice_peer_udp_addr
+    global voice_running, voice_send_thread, voice_recv_thread
+    global voice_state
+    if not voice_backend_ok:
+        return
+    _peer_ip = _voice_peer_tcp_addr()
+    if _peer_ip is None or peer_port <= 0:
+        return
+    _s = voice_udp_sock
+    if _s is None:
+        try:
+            _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _s.bind(("0.0.0.0", 0))
+            _s.settimeout(0.1)
+        except Exception:
+            return
+        voice_udp_sock = _s
+    voice_peer_udp_addr = (_peer_ip, peer_port)
+    if not is_initiator:
+        _my_port = _s.getsockname()[1]
+        net_send_to_peer(f"VOICE_ACCEPT:{_my_port}")
+    voice_state = 'on'
+    voice_running = True
+    voice_send_thread = threading.Thread(target=_voice_send_loop, daemon=True)
+    voice_recv_thread = threading.Thread(target=_voice_recv_loop, daemon=True)
+    voice_send_thread.start()
+    voice_recv_thread.start()
+
+def _voice_stop_call():
+    """停止语音通话并释放资源。"""
+    global voice_running, voice_send_thread, voice_recv_thread, voice_state
+    voice_running = False
+    voice_send_thread = None
+    voice_recv_thread = None
+    voice_state = 'off'
+    _voice_release_udp()
+
+def _voice_request_start():
+    """用户确认开启语音后调用：绑定 UDP 并发送 REQ。"""
+    global voice_udp_sock, voice_state
+    if not voice_backend_ok:
+        return False
+    try:
+        _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _s.bind(("0.0.0.0", 0))
+        _s.settimeout(0.1)
+    except Exception:
+        return False
+    voice_udp_sock = _s
+    _my_port = _s.getsockname()[1]
+    net_send_to_peer(f"VOICE_REQ:{_my_port}")
+    voice_state = 'pending'
+    return True
+
+def get_voice_btn_rect():
+    """返回语音按钮的矩形。放在表情 icon 下方。"""
+    return pygame.Rect(EMOJI_ICON_X, EMOJI_ICON_Y + EMOJI_ICON_SIZE + 5,
+                       EMOJI_ICON_SIZE, EMOJI_ICON_SIZE)
+
+def get_voice_dialog_rect():
+    """返回语音确认框的矩形。"""
+    _w, _h = 480, 240
+    return pygame.Rect((W - _w) // 2, (H - _h) // 2, _w, _h)
+
+def get_voice_volume_panel_rect():
+    """音量调节面板矩形，右键语音按钮时弹出。"""
+    return pygame.Rect(W - 300, 125, 240, 36)
+
+def get_voice_volume_track_rect():
+    """音量滑块的轨道矩形。"""
+    _p = get_voice_volume_panel_rect()
+    return pygame.Rect(_p.x + 12, _p.centery - 4, _p.w - 24, 8)
+
+def draw_voice_ui(mouse_pos):
+    """绘制语音按钮与确认框。仅联机 FIGHT 状态下生效。"""
+    global voice_dialog, voice_dialog_timer
+    global voice_volume_panel_open
+    if not network_connected:
+        return
+    if STATE not in (LAN_READY, DUAL_SELECT_1P, DUAL_SELECT_2P,
+                     SKILL_SELECT_1P, SKILL_SELECT_2P,
+                     WAIT_HOST, LOADING, SHOW_MAP,
+                     FIGHT, FIGHT_KO):
+        return
+    if voice_state != 'on' and voice_volume_panel_open:
+        voice_volume_panel_open = False
+        voice_volume_dragging = False
+    if voice_dialog is not None:
+        _ov = pygame.Surface((W, H), pygame.SRCALPHA)
+        _ov.fill((0, 0, 0, 140))
+        screen.blit(_ov, (0, 0))
+    _btn = get_voice_btn_rect()
+    if voice_state == 'on':
+        _img = voice_speak_img
+        _bg = (40, 130, 40)
+    elif voice_state == 'pending':
+        _img = voice_unspeak_img
+        _bg = (130, 100, 30)
+    else:
+        _img = voice_unspeak_img
+        _bg = (50, 50, 80)
+    if _btn.collidepoint(mouse_pos):
+        _bg = (min(255, _bg[0] + 40),
+               min(255, _bg[1] + 40),
+               min(255, _bg[2] + 40))
+    pygame.draw.rect(screen, _bg, _btn)
+    pygame.draw.rect(screen, (220, 220, 220), _btn, 2)
+    if _img is not None:
+        _simg = pygame.transform.smoothscale(
+            _img, (EMOJI_ICON_SIZE - 6, EMOJI_ICON_SIZE - 6))
+        screen.blit(_simg, (_btn.x + 3, _btn.y + 3))
+    else:
+        _f = get_font(14)
+        _t = _f.render("语", True, (255, 255, 255))
+        screen.blit(_t, _t.get_rect(center=_btn.center))
+    if voice_state == 'pending':
+        _f = get_font(12)
+        _t = _f.render("等待", True, (255, 220, 0))
+        screen.blit(_t, _t.get_rect(midtop=(_btn.centerx, _btn.bottom + 2)))
+    elif voice_state == 'on':
+        _f = get_font(12)
+        _t = _f.render("通话中", True, (100, 255, 100))
+        screen.blit(_t, _t.get_rect(midtop=(_btn.centerx, _btn.bottom + 2)))
+    # 音量调节面板（右键语音按钮切换，滑块拖动）
+    if voice_volume_panel_open:
+        _panel = get_voice_volume_panel_rect()
+        pygame.draw.rect(screen, (30, 30, 45), _panel)
+        pygame.draw.rect(screen, (200, 200, 200), _panel, 2)
+        _track = get_voice_volume_track_rect()
+        pygame.draw.rect(screen, (80, 80, 100), _track)
+        _ratio = max(0.0, min(1.0, voice_volume / 2.0))
+        _fill_w = int(_track.w * _ratio)
+        if _fill_w > 0:
+            pygame.draw.rect(screen, (100, 200, 255),
+                             (_track.x, _track.y, _fill_w, _track.h))
+        _knob_x = _track.x + _fill_w
+        _knob_r = 7
+        pygame.draw.circle(screen, (255, 255, 255),
+                           (_knob_x, _track.centery), _knob_r)
+        _vf2 = get_font(14)
+        _vtxt = _vf2.render(f"{int(round(voice_volume * 100))}%", True, (255, 240, 120))
+        screen.blit(_vtxt, _vtxt.get_rect(midtop=(_panel.centerx, _panel.bottom + 2)))
+    if voice_dialog is None:
+        return
+    _dr = get_voice_dialog_rect()
+    pygame.draw.rect(screen, (40, 40, 55), _dr)
+    pygame.draw.rect(screen, (220, 220, 220), _dr, 3)
+    _title_font = get_font(24)
+    _body_font = get_font(18)
+    if voice_dialog == 'enable_confirm':
+        _title = "开启语音通话？"
+        _lines = [
+            "开启后可能造成游戏卡顿。",
+            "声音会实时传给对方。",
+            "建议在安静环境中使用。",
+        ]
+        _btn_yes = pygame.Rect(_dr.x + 60, _dr.bottom - 70, 150, 46)
+        _btn_no = pygame.Rect(_dr.right - 210, _dr.bottom - 70, 150, 46)
+        _yes_label = "确认开启"
+        _no_label = "取消"
+    elif voice_dialog == 'disable_confirm':
+        _title = "关闭语音通话？"
+        _lines = ["关闭后双方都听不到对方的声音。"]
+        _btn_yes = pygame.Rect(_dr.x + 60, _dr.bottom - 70, 150, 46)
+        _btn_no = pygame.Rect(_dr.right - 210, _dr.bottom - 70, 150, 46)
+        _yes_label = "确认关闭"
+        _no_label = "取消"
+    elif voice_dialog == 'remote_request':
+        _title = "对方请求开启语音"
+        _lines = [
+            "同意后可以实时语音通话。",
+            "开启后可能造成游戏卡顿。",
+        ]
+        _btn_yes = pygame.Rect(_dr.x + 60, _dr.bottom - 70, 150, 46)
+        _btn_no = pygame.Rect(_dr.right - 210, _dr.bottom - 70, 150, 46)
+        _yes_label = "同意"
+        _no_label = "拒绝"
+    elif voice_dialog == 'no_backend':
+        _title = "无法开启语音"
+        _lines = [
+            "缺少音频库 sounddevice 或 numpy。",
+            "请先安装：pip install sounddevice numpy",
+        ]
+        _btn_yes = None
+        _btn_no = pygame.Rect(_dr.centerx - 75, _dr.bottom - 70, 150, 46)
+        _yes_label = ""
+        _no_label = "确定"
+    elif voice_dialog == 'closed_by_peer':
+        _title = "对方已关闭语音通话"
+        _lines = []
+        _btn_yes = None
+        _btn_no = pygame.Rect(_dr.centerx - 75, _dr.bottom - 70, 150, 46)
+        _yes_label = ""
+        _no_label = "确定"
+        if voice_dialog_timer > 0:
+            voice_dialog_timer -= 1
+            if voice_dialog_timer <= 0:
+                voice_dialog = None
+                return
+    else:
+        return
+    _ts = _title_font.render(_title, True, (255, 255, 255))
+    _tsh = _title_font.render(_title, True, (0, 0, 0))
+    _tr = _ts.get_rect(center=(_dr.centerx, _dr.y + 40))
+    for _dx, _dy in ((0, 2), (0, -2), (2, 0), (-2, 0)):
+        screen.blit(_tsh, (_tr.x + _dx, _tr.y + _dy))
+    screen.blit(_ts, _tr)
+    for _i, _ln in enumerate(_lines):
+        _bs = _body_font.render(_ln, True, (230, 230, 230))
+        _br = _bs.get_rect(center=(_dr.centerx, _dr.y + 80 + _i * 26))
+        screen.blit(_bs, _br)
+
+    def _draw_btn(rect, label, color):
+        _h = rect.collidepoint(mouse_pos)
+        _bg2 = color if not _h else (
+            min(255, color[0] + 40),
+            min(255, color[1] + 40),
+            min(255, color[2] + 40))
+        pygame.draw.rect(screen, _bg2, rect)
+        pygame.draw.rect(screen, (240, 240, 240), rect, 2)
+        _f2 = get_font(20)
+        _t2 = _f2.render(label, True, (255, 255, 255))
+        screen.blit(_t2, _t2.get_rect(center=rect.center))
+
+    if _btn_yes is not None and _yes_label:
+        _draw_btn(_btn_yes, _yes_label, (60, 130, 60))
+    if _btn_no is not None and _no_label:
+        _draw_btn(_btn_no, _no_label, (100, 60, 60))
+
+def handle_voice_click(mouse_pos, event_button=1):
+    """处理语音按钮与对话框点击。返回 True 表示事件已消费。"""
+    global voice_dialog, voice_dialog_timer
+    global voice_volume, voice_volume_panel_open, voice_volume_dragging
+    if not network_connected:
+        return False
+    if STATE not in (LAN_READY, DUAL_SELECT_1P, DUAL_SELECT_2P,
+                     SKILL_SELECT_1P, SKILL_SELECT_2P,
+                     WAIT_HOST, LOADING, SHOW_MAP,
+                     FIGHT, FIGHT_KO):
+        return False
+    if voice_dialog is not None:
+        if event_button != 1:
+            return True
+        _dr = get_voice_dialog_rect()
+        if voice_dialog == 'enable_confirm':
+            _yes = pygame.Rect(_dr.x + 60, _dr.bottom - 70, 150, 46)
+            _no = pygame.Rect(_dr.right - 210, _dr.bottom - 70, 150, 46)
+            if _yes.collidepoint(mouse_pos):
+                voice_dialog = None
+                _voice_request_start()
+                return True
+            if _no.collidepoint(mouse_pos):
+                voice_dialog = None
+                return True
+            return True
+        if voice_dialog == 'disable_confirm':
+            _yes = pygame.Rect(_dr.x + 60, _dr.bottom - 70, 150, 46)
+            _no = pygame.Rect(_dr.right - 210, _dr.bottom - 70, 150, 46)
+            if _yes.collidepoint(mouse_pos):
+                net_send_to_peer("VOICE_CLOSE")
+                _voice_stop_call()
+                voice_dialog = None
+                return True
+            if _no.collidepoint(mouse_pos):
+                voice_dialog = None
+                return True
+            return True
+        if voice_dialog == 'remote_request':
+            _yes = pygame.Rect(_dr.x + 60, _dr.bottom - 70, 150, 46)
+            _no = pygame.Rect(_dr.right - 210, _dr.bottom - 70, 150, 46)
+            if _yes.collidepoint(mouse_pos):
+                voice_dialog = None
+                if voice_pending_port > 0:
+                    _voice_start_call(voice_pending_port, is_initiator=False)
+                return True
+            if _no.collidepoint(mouse_pos):
+                voice_dialog = None
+                net_send_to_peer("VOICE_REJECT")
+                return True
+            return True
+        if voice_dialog in ('no_backend', 'closed_by_peer', 'device_error'):
+            _no = pygame.Rect(_dr.centerx - 75, _dr.bottom - 70, 150, 46)
+            if _no.collidepoint(mouse_pos):
+                voice_dialog = None
+                voice_dialog_timer = 0
+                return True
+            return True
+        return True
+    # 右键语音按钮：切换音量面板（仅在通话中）
+    if event_button == 3:
+        _btn = get_voice_btn_rect()
+        if voice_state == 'on' and _btn.collidepoint(mouse_pos):
+            voice_volume_panel_open = not voice_volume_panel_open
+            if not voice_volume_panel_open:
+                voice_volume_dragging = False
+            return True
+        return False
+    # 左键：面板打开时优先处理拖动与收起
+    if voice_volume_panel_open:
+        _track = get_voice_volume_track_rect()
+        _panel = get_voice_volume_panel_rect()
+        if _track.inflate(0, 24).collidepoint(mouse_pos):
+            voice_volume_dragging = True
+            _r = (mouse_pos[0] - _track.x) / max(1, _track.w)
+            _r = max(0.0, min(1.0, _r))
+            voice_volume = round(_r * 2.0, 2)
+            return True
+        if _panel.collidepoint(mouse_pos):
+            return True
+        voice_volume_panel_open = False
+        voice_volume_dragging = False
+        return True
+    _btn = get_voice_btn_rect()
+    if _btn.collidepoint(mouse_pos):
+        if voice_state == 'on':
+            voice_dialog = 'disable_confirm'
+        elif voice_state == 'pending':
+            net_send_to_peer("VOICE_REJECT")
+            _voice_stop_call()
+        else:
+            if not voice_backend_ok:
+                voice_dialog = 'no_backend'
+            else:
+                voice_dialog = 'enable_confirm'
+        return True
+    return False
+
+def handle_voice_volume_drag(mouse_pos):
+    """鼠标拖动时更新音量。仅在 voice_volume_dragging 为真时生效。"""
+    global voice_volume, voice_volume_dragging
+    if not voice_volume_dragging:
+        return False
+    _track = get_voice_volume_track_rect()
+    _r = (mouse_pos[0] - _track.x) / max(1, _track.w)
+    _r = max(0.0, min(1.0, _r))
+    voice_volume = round(_r * 2.0, 2)
+    return True
 
 def draw_wrapped_text(text, x, y, max_width, size=18, line_height=24):
     """按字符宽度自动换行绘制文本（中文不需要按词切）。"""
@@ -2254,6 +2769,8 @@ class Character:
             if not frames:
                 return
             speed = self.skills[self.attack_type]['anim_speed']
+            if self.stamina >= self.max_stamina * 0.8:
+                speed *= 1.5
             self.frame_timer += speed
             if self.frame_timer >= self.frame_speed:
                 self.frame_timer = 0
@@ -2419,7 +2936,10 @@ class Character:
 
         if direction is not None:
             self.facing = direction
-            pos[0] += self.speed if direction == "right" else -self.speed
+            _speed = self.speed
+            if self.stamina >= self.max_stamina * 0.8:
+                _speed *= 1.5
+            pos[0] += _speed if direction == "right" else -_speed
 
         half_width = width // 2
         _bl, _br = get_world_bounds()
@@ -2656,6 +3176,9 @@ class Character:
         # 训练模式下死亡后倒地不动，不再受到任何伤害
         if self.is_training_dead:
             return None
+        # 高体力伤害加成
+        if attacker and attacker.stamina >= attacker.max_stamina * 0.8:
+            damage *= 1.5
         if self.is_invincible or self.is_stand_up_invincible:
             return None
         # 隐身期间被打到：立即结束隐身并进入冷却
@@ -3280,6 +3803,16 @@ if os.path.exists("./temp/emoji"):
             except Exception:
                 pass
 
+# 语音通话图标：speak.png 表示语音开启，upspeak.png 表示语音关闭
+try:
+    voice_speak_img = load_image("./temp/emoji/speak.png")
+except Exception:
+    voice_speak_img = None
+try:
+    voice_unspeak_img = load_image("./temp/emoji/upspeak.png")
+except Exception:
+    voice_unspeak_img = None
+
 # 技能选择页面的当前光标（-1 表示未选择）
 skill_select_idx_1p = -1
 skill_select_idx_2p = -1
@@ -3302,11 +3835,121 @@ except FileNotFoundError:
 except Exception:
     about_lines = []
 
+# ---------- 帮助页面 ----------
+HELP_FILE = "./temp/help.txt"
+HELP_LEFT = 30
+HELP_RIGHT_X = W * 3 // 4
+HELP_TEXT_W = HELP_RIGHT_X - HELP_LEFT - 20
+HELP_TOP = 60
+HELP_BOTTOM = 30
+HELP_VIEW_H = H - HELP_TOP - HELP_BOTTOM
+help_display_lines = []
+help_titles = []
+help_total_h = 0
+help_scroll = 0
+help_loaded = False
+
+# 避头标点：换行时如果下一个要加的字符是这些标点，
+# 就跳过它作为换行点，把标点留在当前行末尾，
+# 真正的换行推迟到标点之后的下一个字符。
+_BREAK_AVOID_CHARS = set(
+    "。，、！？；：）》」』】〕〉”’\"'…—·.,!?;:)"
+)
+
+def _wrap_with_prefix(text, font, max_width, prefix=""):
+    """按字符宽度自动换行，prefix 仅作用于第一行。
+    当下一个要加的字符是避头标点时，即使会超出宽度也不在这里换行，
+    把标点留在当前行末尾；标点之后的字才触发换行。"""
+    lines = []
+    cur = prefix
+    for ch in text:
+        if font.size(cur + ch)[0] > max_width and cur:
+            if ch in _BREAK_AVOID_CHARS:
+                # 标点不应该被换到下一行开头，先把它粘到当前行末尾
+                cur += ch
+                # 容差：连续标点把当前行撑得太长时强制断开，
+                # 避免一行全是标点后仍然一直往后加
+                if font.size(cur)[0] > max_width + 30:
+                    lines.append(cur)
+                    cur = ""
+                continue
+            lines.append(cur)
+            cur = ch
+        else:
+            cur += ch
+    if cur:
+        lines.append(cur)
+    return lines
+
+def _fit_text(text, max_width, size=16):
+    """把文字缩放到适合宽度，返回 (text, size)。"""
+    font = get_font(size)
+    while size > 10 and font.size(text)[0] > max_width:
+        size -= 1
+        font = get_font(size)
+    if font.size(text)[0] > max_width:
+        while len(text) > 1 and font.size(text + "…")[0] > max_width:
+            text = text[:-1]
+        text += "…"
+    return text, size
+
+def get_help_toc_item_rect(i):
+    x = HELP_RIGHT_X + 10
+    y = HELP_TOP + 35 + i * 42
+    return pygame.Rect(x, y, W - HELP_RIGHT_X - 20, 36)
+
+def load_help_content():
+    global help_display_lines, help_titles, help_total_h, help_loaded
+    help_display_lines = []
+    help_titles = []
+    help_total_h = 0
+    help_loaded = True
+    if not os.path.exists(HELP_FILE):
+        return
+    try:
+        with open(HELP_FILE, "r", encoding="utf-8") as f:
+            raw_lines = f.readlines()
+    except Exception:
+        return
+    title_font = get_font(26)
+    body_font = get_font(18)
+    y = 0
+    prev_type = None
+    for raw in raw_lines:
+        line = raw.rstrip("\n").rstrip("\r")
+        if not line.strip():
+            continue
+        if line.startswith("#"):
+            title_text = line[1:].strip()
+            if not title_text:
+                continue
+            if y > 0:
+                y += 14
+            title_y = y
+            wrapped = _wrap_with_prefix(title_text, title_font, HELP_TEXT_W, "")
+            for ln in wrapped:
+                help_display_lines.append((y, ln, 26, 34))
+                y += 34
+            help_titles.append((title_text, title_y))
+            prev_type = 'title'
+        else:
+            if prev_type == 'para':
+                y += int(26 * 0.3)
+            elif prev_type == 'title':
+                y += 6
+            wrapped = _wrap_with_prefix(line, body_font, HELP_TEXT_W, "　　")
+            for ln in wrapped:
+                help_display_lines.append((y, ln, 18, 26))
+                y += 26
+            prev_type = 'para'
+    help_total_h = y
+
 # 主菜单按钮全部改为程序内绘制，main_pro 文件夹可以直接删除
-btn_two = Button(make_text_button("双人"), (400, 300))
-btn_single = Button(make_text_button("训练"), (400, 400))
-btn_about = Button(make_text_button("关于"), (400, 500))
-btn_keys = Button(make_text_button("键位"), (400, 200))
+btn_keys = Button(make_text_button("键位"), (400, 160))
+btn_two = Button(make_text_button("双人"), (400, 240))
+btn_single = Button(make_text_button("训练"), (400, 320))
+btn_about = Button(make_text_button("关于"), (400, 400))
+btn_help = Button(make_text_button("帮助"), (400, 480))
 btn_check_update = Button(make_text_button("检查更新", size=(150, 40), bg=(60, 60, 90), font_size=20), (W - 90, H - 30))
 btn_back = Button(make_text_button("BACK", size=(80, 40), bg=(60, 60, 90), font_size=22), (60, 35))
 btn_exit_room = Button(make_text_button("退出房间", size=(140, 44), bg=(120, 60, 60), font_size=22), (85, 35))
@@ -3649,6 +4292,44 @@ emoji_show_side = None       # 当前展示表情的边（'1p' / '2p' / None）
 emoji_show_img = None        # 当前展示的表情图片
 emoji_show_timer = 0         # 剩余展示帧数（<=0 时隐藏）
 
+# ---------- 局域网语音通话状态 ----------
+# 音频后端：sounddevice 负责采集与播放。未安装时语音功能禁用。
+voice_backend_ok = False
+try:
+    import sounddevice as _sounddevice
+    import numpy as _np
+    voice_backend_ok = True
+except Exception:
+    _sounddevice = None
+    _np = None
+# voice_state: 'off' 关闭 / 'pending' 已发申请 / 'on' 通话中
+voice_state = 'off'
+# voice_dialog: None 或 'enable_confirm' / 'disable_confirm' /
+#               'remote_request' / 'closed_by_peer' / 'no_backend'
+voice_dialog = None
+# voice_dialog_timer: closed_by_peer 提示的自动关闭倒计时（帧）
+voice_dialog_timer = 0
+# 语音通话 UDP 套接字与对方地址
+voice_udp_sock = None
+voice_peer_udp_addr = None
+# 后台线程与运行标志
+voice_send_thread = None
+voice_recv_thread = None
+voice_running = False
+# 对方申请时暂存的对方 UDP 端口，同意时使用
+voice_pending_port = 0
+# 语音设备错误提示（显示在 device_error 对话框中）
+voice_error_msg = ""
+# 播放音量：0.0~2.0，1.0 表示原始音量
+voice_volume = 1.0
+# 音量面板是否打开（右键语音按钮切换）
+voice_volume_panel_open = False
+# 是否正在拖动音量滑块
+voice_volume_dragging = False
+# 采样参数：16kHz / 单声道 / 16bit，每块 20ms = 320 采样
+VOICE_SR = 16000
+VOICE_BLOCK = 320
+
 ui_frame_count = 0
 
 # ---------- 单人模式战斗中设置面板的状态 ----------
@@ -3889,7 +4570,7 @@ def draw_hud(char1, char2, slide=1.0):
         screen.blit(avatar_img, avatar_rect)
 
         bar_x = avatar_rect.right + spacing
-        bar_width = min(bar_max_width, (W // 2 - 30) - bar_x)
+        bar_width = W // 2 - 110
         hp_ratio = char1.hp / char1.max_hp
         pygame.draw.rect(screen, (0, 0, 0), (bar_x - 2, bar_y - 2, bar_width + 4, bar_height + 4))
         pygame.draw.rect(screen, (50, 50, 50), (bar_x, bar_y, bar_width, bar_height))
@@ -3917,6 +4598,11 @@ def draw_hud(char1, char2, slide=1.0):
                          (bar_x, stamina_y, bar_width, stamina_h))
         pygame.draw.rect(screen, (255, 255, 255),
                          (bar_x, stamina_y, bar_width * stamina_ratio, stamina_h))
+        _80_x = bar_x + int(bar_width * 0.8)
+        _line_surf = pygame.Surface((2, stamina_h))
+        _line_surf.fill((255, 255, 255))
+        _line_surf.set_alpha(128)
+        screen.blit(_line_surf, (_80_x, stamina_y))
         pygame.draw.rect(screen, (0, 0, 0),
                          (bar_x - 2, stamina_y - 2, bar_width + 4, stamina_h + 4), 1)
         name_text = font.render(_name_display, True, (255, 255, 255))
@@ -3952,7 +4638,7 @@ def draw_hud(char1, char2, slide=1.0):
         screen.blit(avatar_img, avatar_rect)
 
         bar_x = W // 2 + 30 + p2_dx
-        bar_width = avatar_rect.left - spacing - bar_x
+        bar_width = W // 2 - 110
         hp_ratio = char2.hp / char2.max_hp
         pygame.draw.rect(screen, (0, 0, 0), (bar_x - 2, bar_y - 2, bar_width + 4, bar_height + 4))
         pygame.draw.rect(screen, (50, 50, 50), (bar_x, bar_y, bar_width, bar_height))
@@ -3962,7 +4648,7 @@ def draw_hud(char1, char2, slide=1.0):
             color = (255, 255, 0)
         else:
             color = (255, 0, 0)
-        pygame.draw.rect(screen, color, (bar_x, bar_y, bar_width * hp_ratio, bar_height))
+        pygame.draw.rect(screen, color, (bar_x + bar_width * (1 - hp_ratio), bar_y, bar_width * hp_ratio, bar_height))
         pygame.draw.rect(screen, (0, 0, 0), (bar_x - 2, bar_y - 2, bar_width + 4, bar_height + 4), 2)
 
         # 联机时在角色名后显示身份标签
@@ -3979,7 +4665,13 @@ def draw_hud(char1, char2, slide=1.0):
         pygame.draw.rect(screen, (50, 50, 50),
                          (bar_x, stamina_y, bar_width, stamina_h))
         pygame.draw.rect(screen, (255, 255, 255),
-                         (bar_x, stamina_y, bar_width * stamina_ratio, stamina_h))
+                         (bar_x + bar_width * (1 - stamina_ratio), stamina_y,
+                          bar_width * stamina_ratio, stamina_h))
+        _80_x = bar_x + int(bar_width * 0.2)
+        _line_surf = pygame.Surface((2, stamina_h))
+        _line_surf.fill((255, 255, 255))
+        _line_surf.set_alpha(128)
+        screen.blit(_line_surf, (_80_x, stamina_y))
         pygame.draw.rect(screen, (0, 0, 0),
                          (bar_x - 2, stamina_y - 2, bar_width + 4, stamina_h + 4), 1)
         name_text = font.render(_name_display, True, (255, 255, 255))
@@ -4070,7 +4762,10 @@ def build_network_state():
                        "vx": e['vx'], "owner_index": e['owner_index']}
                       for e in wyk_eggs],
         "skill2_2_weps": [{"x": int(w['x']), "y": int(w['y']),
-                            "facing": w['facing'], "owner_index": w['owner_index']}
+                            "facing": w['facing'], "owner_index": w['owner_index'],
+                            "target_x": int(w.get('target_x', 0)),
+                            "fading": w.get('fading', False),
+                            "alpha": w.get('alpha', 255)}
                            for w in skill2_2_projectiles],
         "dmgs": [{"x": int(n.x), "y": int(n.y), "d": n.damage, "a": n.alpha}
                  for n in damage_numbers if n.alpha > 0],
@@ -4413,6 +5108,9 @@ def apply_network_state(s):
             _lw = _client_wep_by_owner[_owner]
             _lw['y'] = rw['y']
             _lw['facing'] = rw['facing']
+            _lw['target_x'] = rw.get('target_x', 0)
+            _lw['fading'] = rw.get('fading', False)
+            _lw['alpha'] = rw.get('alpha', 255)
             _new_wep_list.append(_lw)
         else:
             _new_wep_list.append({
@@ -4423,6 +5121,9 @@ def apply_network_state(s):
                 'y': rw['y'],
                 'vx': 0,
                 'last_hit_frame': -999,
+                'target_x': rw.get('target_x', 0),
+                'fading': rw.get('fading', False),
+                'alpha': rw.get('alpha', 255),
             })
     skill2_2_projectiles.clear()
     skill2_2_projectiles.extend(_new_wep_list)
@@ -4633,6 +5334,11 @@ def draw_client_fight_view(mouse_pos):
         if _c_orb.name == 'chr_1':
             _pos_orb = char1_pos if _ci_orb == 0 else char2_pos
             draw_chr1_orbit_books(screen, _c_orb, _pos_orb, 'behind')
+    # 高体力粒子：远侧
+    for _ci in range(min(len(fight_chars), 2)):
+        _c = fight_chars[_ci]
+        _pos = char1_pos if _ci == 0 else char2_pos
+        draw_high_stamina_particles(screen, _c, _pos, 'behind')
     # 角色绘制：与主机端分支完全一致——
     # 前摇期间画专用图（chr 技能一 / 技能二；gjl 技能一 / 技能二），
     # 其他状态交给 Character.draw（内部会处理受击倒地/起身/攻击/站立/走/跳）。
@@ -4733,6 +5439,11 @@ def draw_client_fight_view(mouse_pos):
         if _c_orb.name == 'chr_1':
             _pos_orb = char1_pos if _ci_orb == 0 else char2_pos
             draw_chr1_orbit_books(screen, _c_orb, _pos_orb, 'front')
+    # 高体力粒子：近侧
+    for _ci in range(min(len(fight_chars), 2)):
+        _c = fight_chars[_ci]
+        _pos = char1_pos if _ci == 0 else char2_pos
+        draw_high_stamina_particles(screen, _c, _pos, 'front')
     # 投射物
     for proj in book_projectiles:
         if chr_book_img is not None:
@@ -4767,21 +5478,33 @@ def draw_client_fight_view(mouse_pos):
                                      _esize, _ea)
             screen.blit(_eps, (int(_ep[0] - _esize), int(_ep[1] - _esize)))
     # 技能 2 武器：客户端本地预测位置 + 绘制。
-    # 位置每帧自己推进，只在武器首次出现时用主机同步的初始 x，
-    # 之后不会再被 STATE 覆盖，保持滑动平滑。
     for wep in skill2_2_projectiles[:]:
         if wep['facing'] == 'right':
             wep['x'] += SKILL2_2_WEAPON_SPEED
         else:
             wep['x'] -= SKILL2_2_WEAPON_SPEED
-        if wep['x'] < -2000 or wep['x'] > W + 2000:
+        if wep['x'] < -2000 or wep['x'] > MAP_W + 2000:
             skill2_2_projectiles.remove(wep)
             continue
+        if not wep.get('fading', False):
+            if wep['facing'] == 'right' and wep['x'] >= wep.get('target_x', 0):
+                wep['fading'] = True
+            elif wep['facing'] == 'left' and wep['x'] <= wep.get('target_x', MAP_W):
+                wep['fading'] = True
+        if wep.get('fading', False):
+            wep['alpha'] = max(0, wep.get('alpha', 255) - 5)
+            if wep['alpha'] <= 0:
+                skill2_2_projectiles.remove(wep)
+                continue
         if skill2_2_img is not None:
             _img = skill2_2_img
             if wep['facing'] == 'left':
                 _img = get_flip(_img)
             _r = _img.get_rect(center=(int(wep['x']), int(wep['y'])))
+            _alpha = wep.get('alpha', 255)
+            if _alpha < 255:
+                _img = _img.copy()
+                _img.set_alpha(_alpha)
             screen.blit(_img, _r)
     # gjl 技能二的 code 投射物：位置由主机同步，直接画即可。
     # 图片默认朝右（angle=0 不旋转），按 angle 逆时针旋转。
@@ -5048,6 +5771,8 @@ def draw_client_fight_view(mouse_pos):
 
     # 联机表情 UI（icon 按钮 + 气泡面板 + 已发出的表情气泡）
     draw_emoji_ui(mouse_pos)
+    # 联机语音 UI（语音按钮 + 确认框）
+    draw_voice_ui(mouse_pos)
 
     # 技能 2 屏幕震动：整屏随机偏移（UI 也一起抖动）
     if any_skill2_2_active():
@@ -5587,6 +6312,23 @@ while running:
         if _peer_input_blocked:
             continue
 
+        # 联机语音：房间内所有页面统一拦截点击、拖动与松开
+        if (network_connected
+                and STATE in (LAN_READY, DUAL_SELECT_1P, DUAL_SELECT_2P,
+                              SKILL_SELECT_1P, SKILL_SELECT_2P,
+                              WAIT_HOST, LOADING, SHOW_MAP,
+                              FIGHT, FIGHT_KO)):
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
+                if handle_voice_click(mouse_pos, event.button):
+                    continue
+            elif event.type == pygame.MOUSEMOTION and voice_volume_dragging:
+                handle_voice_volume_drag(mouse_pos)
+                continue
+            elif (event.type == pygame.MOUSEBUTTONUP
+                    and event.button == 1 and voice_volume_dragging):
+                voice_volume_dragging = False
+                continue
+
         if STATE == MENU:
             # 注意：主菜单按钮点击后立即 break，让这一帧剩余的鼠标事件
             # 不再被新状态（如 KEYS 页面）的事件处理捕获。
@@ -5601,6 +6343,12 @@ while running:
                 break
             if btn_about.clicked(mouse_pos, event):
                 STATE = ABOUT
+                break
+            if btn_help.clicked(mouse_pos, event):
+                if not help_loaded:
+                    load_help_content()
+                help_scroll = 0
+                STATE = HELP
                 break
             if btn_keys is not None and btn_keys.clicked(mouse_pos, event):
                 STATE = KEYS
@@ -6297,6 +7045,24 @@ while running:
             if btn_back.clicked(mouse_pos, event):
                 STATE = MENU
 
+        elif STATE == HELP:
+            if event.type == pygame.MOUSEWHEEL:
+                _max_scroll = max(0, help_total_h - HELP_VIEW_H)
+                help_scroll -= event.y * 30
+                if help_scroll < 0:
+                    help_scroll = 0
+                elif help_scroll > _max_scroll:
+                    help_scroll = _max_scroll
+            elif btn_back.clicked(mouse_pos, event):
+                STATE = MENU
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for _ti, (_tt, _ty) in enumerate(help_titles):
+                    _tr = get_help_toc_item_rect(_ti)
+                    if _tr.collidepoint(mouse_pos):
+                        _ms = max(0, help_total_h - HELP_VIEW_H)
+                        help_scroll = min(_ty, _ms)
+                        break
+
         elif STATE == KEYS:
             if keys_editing_idx >= 0:
                 # 正在等待输入：按下任意键就修改，ESC 取消
@@ -6551,6 +7317,13 @@ while running:
                     ko_bounce_count = 0
                 btn_exit_room.rect.center = _orig_exit_ev_c
 
+        # 联机语音：按钮与对话框点击处理
+        # 对话框打开时，所有点击都被对话框拦截，避免穿透到游戏操作
+        if (STATE == FIGHT and network_connected
+                and event.type == pygame.MOUSEBUTTONDOWN
+                and event.button in (1, 3)):
+            if handle_voice_click(mouse_pos, event.button):
+                continue
         # 联机表情：icon 按钮与气泡面板的点击处理
         # KO 结算期间禁止再发送表情
         if (STATE == FIGHT and ko_phase == 0 and network_connected
@@ -6772,6 +7545,8 @@ while running:
         btn_two.draw(mouse_pos)
         btn_single.draw(mouse_pos)
         btn_about.draw(mouse_pos)
+        if btn_help is not None:
+            btn_help.draw(mouse_pos)
         if btn_keys is not None:
             btn_keys.draw(mouse_pos)
         btn_check_update.draw(mouse_pos)
@@ -6794,6 +7569,50 @@ while running:
         gjl_head_rot = pygame.transform.rotate(gjl_head, -frame_count * 5 % 360)
         screen.blit(chr_head_rot, chr_head_rot.get_rect(center=(600, 400)))
         screen.blit(gjl_head_rot, gjl_head_rot.get_rect(center=(200, 400)))
+
+    elif STATE == HELP:
+        screen.fill((0, 0, 0))
+        draw_brick_wall(brick_img)
+        btn_back.draw(mouse_pos)
+        if not help_loaded:
+            load_help_content()
+        # 左侧正文
+        _clip = pygame.Rect(HELP_LEFT - 10, HELP_TOP - 10, HELP_TEXT_W + 20, HELP_VIEW_H + 20)
+        screen.set_clip(_clip)
+        for _ly, _lt, _lfs, _lh in help_display_lines:
+            _sy = HELP_TOP + _ly - help_scroll
+            if _sy + _lh < HELP_TOP - 20:
+                continue
+            if _sy > HELP_TOP + HELP_VIEW_H + 20:
+                break
+            bordered_text(_lt, (HELP_LEFT, _sy), "topleft", size=_lfs)
+        screen.set_clip(None)
+        # 右侧大纲
+        _toc_w = W - HELP_RIGHT_X
+        _toc_bg = pygame.Surface((_toc_w, HELP_VIEW_H), pygame.SRCALPHA)
+        _toc_bg.fill((20, 20, 30, 200))
+        screen.blit(_toc_bg, (HELP_RIGHT_X, HELP_TOP))
+        pygame.draw.rect(screen, (100, 100, 120),
+                         (HELP_RIGHT_X, HELP_TOP, _toc_w, HELP_VIEW_H), 2)
+        bordered_text("大纲", (HELP_RIGHT_X + _toc_w // 2, HELP_TOP + 16),
+                      "center", size=18)
+        _active_title_idx = -1
+        for _ti in range(len(help_titles)):
+            if help_titles[_ti][1] <= help_scroll:
+                _active_title_idx = _ti
+            else:
+                break
+        for _ti, (_tt, _ty) in enumerate(help_titles):
+            _tr = get_help_toc_item_rect(_ti)
+            if _tr.bottom > HELP_TOP + HELP_VIEW_H:
+                break
+            _hover = _tr.collidepoint(mouse_pos)
+            if _hover:
+                pygame.draw.rect(screen, (80, 80, 120), _tr)
+            elif _ti == _active_title_idx:
+                pygame.draw.rect(screen, (50, 50, 80), _tr)
+            _fit_t, _fit_s = _fit_text(_tt, _tr.w - 12, 16)
+            bordered_text(_fit_t, _tr.center, "center", size=_fit_s)
 
     elif STATE == KEYS:
         screen.fill((0, 0, 0))
@@ -7619,6 +8438,11 @@ while running:
                 if _c_orb.name == 'chr_1':
                     _pos_orb = char1_pos if _ci_orb == 0 else char2_pos
                     draw_chr1_orbit_books(screen, _c_orb, _pos_orb, 'behind')
+            # 高体力粒子：远侧
+            for _ci in range(min(len(fight_chars), 2)):
+                _c = fight_chars[_ci]
+                _pos = char1_pos if _ci == 0 else char2_pos
+                draw_high_stamina_particles(screen, _c, _pos, 'behind')
 
             # ===== 玩家1 =====
             if len(fight_chars) >= 1:
@@ -9424,6 +10248,11 @@ while running:
                 if _c_orb.name == 'chr_1':
                     _pos_orb = char1_pos if _ci_orb == 0 else char2_pos
                     draw_chr1_orbit_books(screen, _c_orb, _pos_orb, 'front')
+            # 高体力粒子：近侧
+            for _ci in range(min(len(fight_chars), 2)):
+                _c = fight_chars[_ci]
+                _pos = char1_pos if _ci == 0 else char2_pos
+                draw_high_stamina_particles(screen, _c, _pos, 'front')
 
             # 绘制书本
             for proj in book_projectiles:
@@ -9447,11 +10276,25 @@ while running:
             # ===== 技能 2 武器更新与碰撞 =====
             for wep in skill2_2_projectiles[:]:
                 wep['x'] += wep['vx']
-                # 完全滑出屏幕后移除（留一点余量，避免刚出屏就被移除）
-                if wep['x'] < -2000 or wep['x'] > W + 2000:
+                # 完全滑出屏幕后移除
+                if wep['x'] < -2000 or wep['x'] > MAP_W + 2000:
                     skill2_2_projectiles.remove(wep)
                     continue
+                # 检查是否到达记录的位置，触发渐隐
+                if not wep.get('fading', False):
+                    if wep['facing'] == 'right' and wep['x'] >= wep.get('target_x', 0):
+                        wep['fading'] = True
+                    elif wep['facing'] == 'left' and wep['x'] <= wep.get('target_x', MAP_W):
+                        wep['fading'] = True
+                if wep.get('fading', False):
+                    wep['alpha'] = max(0, wep.get('alpha', 255) - 5)
+                    if wep['alpha'] <= 0:
+                        skill2_2_projectiles.remove(wep)
+                        continue
                 if len(fight_chars) < 2:
+                    continue
+                # 渐隐时不造成伤害
+                if wep.get('fading', False):
                     continue
                 target_idx = wep['target_index']
                 if target_idx >= len(fight_chars):
@@ -9467,14 +10310,11 @@ while running:
                 wep_rect = pygame.Rect(0, 0, bw, bh)
                 wep_rect.center = (int(wep['x']), int(wep['y']))
                 if wep_rect.colliderect(target_rect):
-                    # 0.1s 伤害间隔：两次命中之间至少 6 帧
                     if ui_frame_count - wep['last_hit_frame'] >= SKILL2_2_HIT_INTERVAL_FRAMES:
                         new_num = target.take_damage(
                             SKILL2_2_DAMAGE, wep['facing'], [wep['x'], wep['y']],
                             fight_chars[wep['owner_index']]
                         )
-                        # 只有真正造成伤害时才记录命中时间；
-                        # 目标无敌时视为空击，武器继续滑动。
                         if new_num is not None:
                             wep['last_hit_frame'] = ui_frame_count
                             new_num.x = target_pos[0]
@@ -9489,6 +10329,10 @@ while running:
                     if wep['facing'] == 'left':
                         _img = get_flip(_img)
                     _r = _img.get_rect(center=(int(wep['x']), int(wep['y'])))
+                    _alpha = wep.get('alpha', 255)
+                    if _alpha < 255:
+                        _img = _img.copy()
+                        _img.set_alpha(_alpha)
                     screen.blit(_img, _r)
 
             # 绘制 gjl 技能二的 code 投射物
@@ -9793,18 +10637,21 @@ while running:
                 'escape': (120, H - 120 + icon_dy),
                 'extra': (190, H - 120 + icon_dy),
             }
+            _p2_lan_icon_pos = {
+                'normal': (W - 50, H - 50 + icon_dy),
+                'skill_1': (W - 120, H - 50 + icon_dy),
+                'skill_2': (W - 190, H - 50 + icon_dy),
+                'escape': (W - 120, H - 120 + icon_dy),
+                'extra': (W - 190, H - 120 + icon_dy),
+            }
             if _show_p1 and len(fight_chars) >= 1:
                 char1 = fight_chars[0]
                 for i, skill_name in enumerate(skill_order):
                     img = char1.icons.get(skill_name)
                     if img is None:
                         continue
-                    if network_connected:
-                        _cx, _cy = _lan_icon_pos[skill_name]
-                        icon = SkillIcon(img, (_cx, _cy), key_label=p1_keys[i])
-                    else:
-                        x = start_x_left + i * spacing
-                        icon = SkillIcon(img, (x, y_pos), key_label=p1_keys[i])
+                    _cx, _cy = _lan_icon_pos[skill_name]
+                    icon = SkillIcon(img, (_cx, _cy), key_label=p1_keys[i])
                     is_cooling = char1.skills[skill_name]['current_cd'] > 0
                     cd_remaining_seconds = char1.skills[skill_name]['current_cd'] / FPS
                     overlay_text = None
@@ -9868,12 +10715,8 @@ while running:
                     img = char2.icons.get(skill_name)
                     if img is None:
                         continue
-                    if network_connected:
-                        _cx, _cy = _lan_icon_pos[skill_name]
-                        icon = SkillIcon(img, (_cx, _cy), key_label=_p2_label_keys[i])
-                    else:
-                        x = start_x_right - (len(skill_order) - 1) * spacing + i * spacing
-                        icon = SkillIcon(img, (x, y_pos), key_label=_p2_label_keys[i])
+                    _cx, _cy = _p2_lan_icon_pos[skill_name]
+                    icon = SkillIcon(img, (_cx, _cy), key_label=_p2_label_keys[i])
                     is_cooling = char2.skills[skill_name]['current_cd'] > 0
                     cd_remaining_seconds = char2.skills[skill_name]['current_cd'] / FPS
                     overlay_text = None
@@ -10005,6 +10848,8 @@ while running:
 
             # 联机表情 UI（icon 按钮 + 气泡面板 + 已发出的表情气泡）
             draw_emoji_ui(mouse_pos)
+            # 联机语音 UI（语音按钮 + 确认框）
+            draw_voice_ui(mouse_pos)
 
         # ===== 技能 2 屏幕震动：整屏随机偏移 =====
         # 在 UI 绘制之后应用，这样 UI 也跟着一起抖。
@@ -10268,6 +11113,14 @@ while running:
         pygame.draw.rect(screen, (20, 20, 20), _rbg)
         pygame.draw.rect(screen, (180, 180, 180), _rbg, 1)
         screen.blit(_rsurf, _rrect)
+
+    # 联机语音：房间内所有页面统一绘制语音按钮与确认框（最上层）
+    if (network_connected
+            and STATE in (LAN_READY, DUAL_SELECT_1P, DUAL_SELECT_2P,
+                          SKILL_SELECT_1P, SKILL_SELECT_2P,
+                          WAIT_HOST, LOADING, SHOW_MAP,
+                          FIGHT, FIGHT_KO)):
+        draw_voice_ui(mouse_pos)
 
     pygame.display.flip()
     clock.tick(FPS)

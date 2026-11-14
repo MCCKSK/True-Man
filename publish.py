@@ -5,10 +5,11 @@ r"""
 2. 删除 build 文件夹和 main.spec
 3. 从 temp/NONJ.config 第一行提取版本号
 4. 将 temp 文件夹及其内部文件复制到 dist/main 内部
-5. dist/main -> dist/TrueMan-v{版本号}
-6. 移动到 C:\Users\123\Desktop
-7. 删除 dist 文件夹
-8. 启动 Enigma Virtual Box，并把版本名复制到剪贴板
+5. 将 dist/main/main.exe 重命名为 TrueMan-v{版本号}.exe
+6. dist/main -> dist/TrueMan-v{版本号}
+7. 移动到 C:\Users\123\Desktop
+8. 删除 dist 文件夹
+9. 启动 Enigma Virtual Box，并把版本名复制到剪贴板
 成功则直接关闭黑窗；出错则暂停并显示原因。
 """
 
@@ -89,7 +90,7 @@ def main():
     log("=" * 48)
 
     # ---------- 1. 调用 pyinstaller 打包 ----------
-    log("[1/8] 执行 pyinstaller 打包 ...")
+    log("[1/9] 执行 pyinstaller 打包 ...")
     if not PYINSTALLER.exists():
         log(f"[错误] 找不到 pyinstaller：{PYINSTALLER}")
         return 1
@@ -113,7 +114,7 @@ def main():
     log("      打包完成")
 
     # ---------- 2. 删除 build 文件夹和 main.spec ----------
-    log("[2/8] 清理 build 文件夹和 main.spec ...")
+    log("[2/9] 清理 build 文件夹和 main.spec ...")
     build_dir = base / "build"
     if build_dir.exists():
         shutil.rmtree(build_dir)
@@ -129,7 +130,7 @@ def main():
         log("      main.spec 不存在，跳过")
 
     # ---------- 3. 读取版本号 ----------
-    log("[3/8] 读取版本号 ...")
+    log("[3/9] 读取版本号 ...")
     temp_src = base / "temp"
     config = temp_src / "NONJ.config"
     if not config.exists():
@@ -151,7 +152,7 @@ def main():
     target_name = f"TrueMan-v{ver}"
 
     # ---------- 4. 复制 temp 文件夹到 dist\main 内部 ----------
-    log("[4/8] 复制 temp 文件夹到 dist\\main 内部 ...")
+    log("[4/9] 复制 temp 文件夹到 dist\\main 内部 ...")
     dist_dir = base / "dist"
     src_main = dist_dir / "main"
     if not src_main.exists():
@@ -169,8 +170,27 @@ def main():
     shutil.copytree(str(temp_src), str(temp_dst))
     log(f"      已复制到 {temp_dst}")
 
-    # ---------- 5. 重命名 dist\main ----------
-    log(f"[5/8] 重命名 dist\\main 为 {target_name} ...")
+    # ---------- 5. 将 main.exe 重命名为 TrueMan-v{版本号}.exe ----------
+    log(f"[5/9] 将 main.exe 重命名为 {target_name}.exe ...")
+    exe_src = src_main / "main.exe"
+    if not exe_src.exists():
+        log(f"[错误] 找不到 {exe_src}")
+        return 1
+
+    exe_dst = src_main / f"{target_name}.exe"
+    if exe_dst.exists():
+        log(f"      目标 {exe_dst.name} 已存在，先删除")
+        exe_dst.unlink()
+
+    try:
+        exe_src.rename(exe_dst)
+    except OSError as e:
+        log(f"[错误] 重命名 main.exe 失败：{e}")
+        return 1
+    log(f"      已重命名为 {exe_dst.name}")
+
+    # ---------- 6. 重命名 dist\main ----------
+    log(f"[6/9] 重命名 dist\\main 为 {target_name} ...")
     dst_main = dist_dir / target_name
     if dst_main.exists():
         log(f"      目标已存在，先删除旧的 {dst_main}")
@@ -179,8 +199,8 @@ def main():
     src_main.rename(dst_main)
     log("      重命名完成")
 
-    # ---------- 6. 移动到桌面 ----------
-    log(f"[6/8] 移动到 {DESKTOP} ...")
+    # ---------- 7. 移动到桌面 ----------
+    log(f"[7/9] 移动到 {DESKTOP} ...")
     if not DESKTOP.exists():
         log(f"[错误] 目标路径不存在：{DESKTOP}")
         return 1
@@ -193,14 +213,14 @@ def main():
     shutil.move(str(dst_main), str(dst_desktop))
     log("      移动完成")
 
-    # ---------- 7. 删除 dist ----------
-    log("[7/8] 删除 dist 文件夹 ...")
+    # ---------- 8. 删除 dist ----------
+    log("[8/9] 删除 dist 文件夹 ...")
     if dist_dir.exists():
         shutil.rmtree(dist_dir)
         log("      已删除 dist 文件夹")
 
-    # ---------- 8. 启动 Enigma Virtual Box ----------
-    log("[8/8] 启动 Enigma Virtual Box ...")
+    # ---------- 9. 启动 Enigma Virtual Box ----------
+    log("[9/9] 启动 Enigma Virtual Box ...")
     if not ENIGMA.exists():
         log(f"[错误] 找不到 {ENIGMA}")
         return 1
@@ -229,6 +249,7 @@ def main():
     log("=" * 48)
     log("  全部完成！")
     log(f"  输出位置：{dst_desktop}")
+    log(f"  可执行文件：{dst_desktop / (target_name + '.exe')}")
     log(f"  内含 temp 目录：{dst_desktop / 'temp'}")
     log(f"  剪贴板内容：{target_name}")
     log("  Enigma Virtual Box 已打开，请手动完成封装")

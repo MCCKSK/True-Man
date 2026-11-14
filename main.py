@@ -9,6 +9,7 @@ import socket
 import collections
 import threading
 import tempfile
+import concurrent.futures
 import zipfile
 import subprocess
 import urllib.request
@@ -5061,6 +5062,7 @@ UPDATE_REPO = "MCCKSK/True-Man"
 update_lock = threading.Lock()
 update_popup = None
 update_pending_zip_url = None
+update_pending_version = None
 update_ready_to_exit = False
 # 下载进度：{"downloaded": int, "total": int|None, "phase": "download"|"apply"}
 update_download_progress = None
@@ -5137,28 +5139,28 @@ def check_update_thread(silent):
                 update_popup = {"type": "check_fail", "msg": f"已是最新版本 {ver}"}
 
 
-def download_and_apply_thread(zip_url):
+def download_and_apply_thread(zip_url, new_version=None):
     """下载 zip -> 解压到临时目录 -> 写 bat -> 启动 bat -> 通知主循环退出。"""
-    global update_popup, update_pending_zip_url, update_ready_to_exit, update_download_progress
+    global update_popup, update_pending_zip_url, update_ready_to_exit, update_download_progress, update_pending_version
     update_pending_zip_url = zip_url
+    update_pending_version = new_version
     if not getattr(sys, "frozen", False):
         with update_lock:
             update_popup = {"type": "download_fail", "msg": "当前为源码运行，自动更新仅限 exe 版，请手动下载"}
         return
     try:
+        import time
         game_dir = os.path.dirname(os.path.abspath(sys.executable))
         exe_name = os.path.basename(sys.executable)
         temp_dir = tempfile.mkdtemp(prefix="trueman_update_")
         zip_path = os.path.join(temp_dir, "update.zip")
-        # 纯 Python 多代理镜像下载，自动校验 ZIP 完整性，杜绝下载到网页源码
-        import time
+        
+        # 纯 Python 多线程分段并行下载，无黑窗，防卡死
         _proxies = [
             "", # 原链接
             "https://ghproxy.net/",
             "https://ghfast.top/",
             "https://gh.llkk.cc/",
-            "https://gh-proxy.com/",
-            "https://github.moeyy.xyz/",
         ]
         _urls_to_try = []
         _clean_url = zip_url.replace("https://github.com/", "")
@@ -5171,87 +5173,85 @@ def download_and_apply_thread(zip_url):
         _success = False
         _last_err = ""
         for _try_url in _urls_to_try:
-            _domain = _try_url.split('/')[2] if '/' in _try_url else '直连'
-            with update_lock:
-                update_download_progress = {"phase": "download", "note": f"尝试节点: {_domain}..."}
             try:
-                _req = urllib.request.Request(_try_url, headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept": "*/*"
-                })
-                # 将超时设为 30 秒，防止网络波动（如瞬断 5-10 秒）导致频繁切换节点
-                with urllib.request.urlopen(_req, timeout=30) as r:
+                # 1. 探测是否支持分段 (HEAD 请求)
+                _req = urllib.request.Request(_try_url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(_req, timeout=10) as r:
                     _total = int(r.headers.get("Content-Length") or 0)
-                    if _total <= 0:
-                        _total = None
-                    _downloaded = 0
-                    _start_t = time.time()
-                    _history = []
-                    with open(zip_path, "wb") as f:
-                        while True:
-                            _chunk = r.read(65536)
-                            if not _chunk:
-                                break
-                            f.write(_chunk)
-                            _downloaded += len(_chunk)
+                    _accept_ranges = r.headers.get("Accept-Ranges") == "bytes"
+                    
+                if _total <= 0:
+                    continue
+                    
+                with open(zip_path, "wb") as f:
+                    f.truncate(_total)
+                    
+                _downloaded = 0
+                _start_t = time.time()
+                _lock = threading.Lock()
+                
+                def _download_chunk(_s, _e):
+                    nonlocal _downloaded
+                    _headers = {"User-Agent": "Mozilla/5.0", "Range": f"bytes={_s}-{_e}"}
+                    _r = urllib.request.Request(_try_url, headers=_headers)
+                    try:
+                        with urllib.request.urlopen(_r, timeout=30) as resp:
+                            with open(zip_path, "r+b") as file:
+                                file.seek(_s)
+                                while True:
+                                    _chunk = resp.read(65536)
+                                    if not _chunk:
+                                        break
+                                    file.write(_chunk)
+                                    with _lock:
+                                        _downloaded += len(_chunk)
+                    except Exception as ex:
+                        raise RuntimeError(str(ex))
+
+                _done = False
+                if _accept_ranges:
+                    _threads = 8
+                    _chunk_sz = _total // _threads
+                    _futures = []
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=_threads) as ex:
+                        for i in range(_threads):
+                            st = i * _chunk_sz
+                            ed = _total - 1 if i == _threads - 1 else (st + _chunk_sz - 1)
+                            _futures.append(ex.submit(_download_chunk, st, ed))
+                        while any(not f.done() for f in _futures):
                             _now = time.time()
-                            _history.append((_now, _downloaded))
-                            while _history and _now - _history[0][0] > 2.0:
-                                _history.pop(0)
-                            
-                            if len(_history) > 1 and _history[-1][0] - _history[0][0] > 0.1:
-                                _delta_t = _history[-1][0] - _history[0][0]
-                                _delta_b = _history[-1][1] - _history[0][1]
-                                _speed_bps = _delta_b / _delta_t
-                            else:
-                                _elapsed_s = _now - _start_t
-                                _speed_bps = _downloaded / _elapsed_s if _elapsed_s > 0 else 0
-                            
-                            if _speed_bps <= 0:
-                                _speed_bps = 1
-                                
-                            _spd_str = _fmt_size(_speed_bps) + "/s"
-                            if _total and _speed_bps > 0:
-                                _pct = int(_downloaded * 100 / _total)
-                                _eta_s = int((_total - _downloaded) / _speed_bps)
-                                _eta_str = f"{_eta_s // 60:02d}:{_eta_s % 60:02d}"
-                            else:
-                                _pct = None
-                                _eta_str = "--:--"
+                            _el = max(0.1, _now - _start_t)
+                            _spd = _downloaded / _el
+                            _spd_str = _fmt_size(_spd) + "/s"
+                            _pct = int(_downloaded * 100 / _total)
+                            _eta = int((_total - _downloaded) / _spd) if _spd > 0 else 0
                             with update_lock:
                                 update_download_progress = {
-                                    "phase": "download",
-                                    "percentage": _pct,
-                                    "speed": _spd_str,
-                                    "eta": _eta_str,
-                                    "downloaded": _downloaded,
-                                    "total": _total
+                                    "phase": "download", "percentage": _pct,
+                                    "speed": _spd_str, "eta": f"{_eta // 60:02d}:{_eta % 60:02d}",
+                                    "downloaded": _downloaded, "total": _total
                                 }
-                    # 检查是否发生了截断
-                    if _total and _downloaded < _total:
-                        raise RuntimeError("下载提前中断，文件不完整")
-                    # 核心校验：确认文件是合法的 ZIP 格式，否则说明节点返回了错误网页
-                    if not zipfile.is_zipfile(zip_path):
-                        raise RuntimeError("下载的内容不是合法的ZIP（节点可能已失效）")
+                            time.sleep(0.1)
+                        for f in _futures:
+                            f.result()
+                else:
+                    _download_chunk(0, _total - 1)
                     
-                    _success = True
-                    break
+                if _downloaded < _total:
+                    raise RuntimeError("下载未完成")
+                if not zipfile.is_zipfile(zip_path):
+                    raise RuntimeError("非合法ZIP")
+                _success = True
+                break
             except Exception as e:
                 _last_err = str(e)
-                # 清理下载失败的残损文件，准备用下一个节点重试
                 if os.path.exists(zip_path):
-                    try:
-                        os.remove(zip_path)
-                    except Exception:
-                        pass
+                    try: os.remove(zip_path)
+                    except: pass
                 continue
         if not _success:
-            raise RuntimeError(f"所有节点均下载失败。最后错误: {_last_err[:100]}")
-        # gh-download 下载后文件在 temp_dir/update.zip
-        _downloaded_path = os.path.join(temp_dir, "update.zip")
-        if not os.path.exists(_downloaded_path):
-            raise RuntimeError(f"下载完成但找不到文件: {_downloaded_path}")
-        zip_path = _downloaded_path
+            raise RuntimeError(f"下载失败: {_last_err[:100]}")
+        
         with update_lock:
             update_download_progress = {"phase": "apply"}
         extract_dir = os.path.join(temp_dir, "extract")
@@ -5268,20 +5268,38 @@ def download_and_apply_thread(zip_url):
                 if _f.lower().endswith(".exe"):
                     exe_name = _f
                     break
+        parent_dir = os.path.dirname(game_dir)
+        old_folder_name = os.path.basename(game_dir)
+        if not new_version:
+            new_version = "latest"
+        new_folder_name = f"TrueMan-v{new_version}"
+        new_game_dir = os.path.join(parent_dir, new_folder_name)
         bat_path = os.path.join(temp_dir, "update.bat")
         with open(bat_path, "w", encoding="gbk", errors="replace") as f:
             f.write("@echo off\n")
             f.write("chcp 936 >nul\n")
             f.write("timeout /t 3 /nobreak >nul\n")
-            f.write(f'cd /d "{game_dir}"\n')
-            f.write(f'del /f /s /q "{game_dir}\\*.*" 2>nul\n')
-            f.write(f'for /d %%D in ("{game_dir}\\*") do rd /s /q "%%D" 2>nul\n')
-            f.write(f'xcopy /e /y /i /q "{source_dir}\\*" "{game_dir}\\" >nul\n')
-            f.write(f'start "" "{os.path.join(game_dir, exe_name)}"\n')
+            f.write(f'cd /d "{parent_dir}"\n')
+            f.write(f'if not "{old_folder_name}" == "{new_folder_name}" (\n')
+            f.write(f'    if exist "{new_folder_name}" rd /s /q "{new_folder_name}" 2>nul\n')
+            f.write(f'    ren "{old_folder_name}" "{new_folder_name}"\n')
+            f.write(f')\n')
+            f.write(f':retry_del\n')
+            f.write(f'if exist "{new_game_dir}" rd /s /q "{new_game_dir}" 2>nul\n')
+            f.write(f'if exist "{new_game_dir}" (timeout /t 2 /nobreak >nul & goto retry_del)\n')
+            f.write(f'mkdir "{new_game_dir}"\n')
+            f.write(f'cd /d "{new_game_dir}"\n')
+            f.write(f':retry_copy\n')
+            f.write(f'xcopy /e /y /i /q "{source_dir}\\*" "{new_game_dir}\\" >nul\n')
+            f.write(f'if errorlevel 1 (timeout /t 2 /nobreak >nul & goto retry_copy)\n')
+            f.write(f'if exist "{os.path.join(new_game_dir, exe_name)}" (\n')
+            f.write(f'    start "" /D "{new_game_dir}" "{exe_name}"\n')
+            f.write(f')\n')
             f.write(f'del /f /q "{zip_path}" 2>nul\n')
             f.write(f'rd /s /q "{extract_dir}" 2>nul\n')
+        _flags = 0x08000000 if os.name == "nt" else 0
         subprocess.Popen(["cmd", "/c", bat_path],
-                         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                         creationflags=_flags,
                          close_fds=True)
         update_ready_to_exit = True
     except Exception as e:
@@ -5429,7 +5447,7 @@ def _handle_update_popup_event(mouse_pos, event):
                 update_popup = {"type": "downloading"}
                 update_download_progress = None
             threading.Thread(target=download_and_apply_thread,
-                             args=(popup["zip_url"],), daemon=True).start()
+                             args=(popup["zip_url"], popup.get("version", "")), daemon=True).start()
         elif btn_r.collidepoint(mouse_pos):
             with update_lock:
                 update_popup = None
@@ -5444,7 +5462,7 @@ def _handle_update_popup_event(mouse_pos, event):
                     update_popup = {"type": "downloading"}
                     update_download_progress = None
                 threading.Thread(target=download_and_apply_thread,
-                                 args=(update_pending_zip_url,), daemon=True).start()
+                                 args=(update_pending_zip_url, update_pending_version), daemon=True).start()
         elif btn_r.collidepoint(mouse_pos):
             with update_lock:
                 update_popup = None

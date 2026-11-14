@@ -5836,62 +5836,90 @@ def _strip_v(tag):
 
 def _read_custom_update_url():
     """从 GitHub raw 地址读取 link.txt 中的自定义直链。
-    link.txt 只放一行下载地址；版本号从地址文件名中提取。
+    link.txt 第一行放下载地址，第二行放该地址对应的版本号
+    （例如 v0.4.2-beta 或 0.4.2-beta，v 前缀会被自动去掉）。
+    第二行为空或缺失时，回退到从第一行地址文件名中提取版本号。
     读取失败、内容无效或无法提取版本号时返回 None，由调用方回退到 GitHub Release。"""
     _link_url = "https://raw.githubusercontent.com/MCCKSK/True-Man/main/link.txt"
     try:
         _req = urllib.request.Request(
             _link_url, headers={"User-Agent": "TrueMan-Updater"})
         with urllib.request.urlopen(_req, timeout=8) as _resp:
-            _body = _resp.read().decode("utf-8", errors="ignore").strip()
+            _body = _resp.read().decode("utf-8", errors="ignore")
     except Exception:
         return None
-    if not _body:
+    _lines = [x.strip() for x in _body.splitlines() if x.strip()]
+    if not _lines:
         return None
-    if not (_body.startswith("http://") or _body.startswith("https://")):
+    _url = _lines[0]
+    if not (_url.startswith("http://") or _url.startswith("https://")):
         return None
     _ver = ""
-    _m = re.search(r'[vV]?(\d+\.\d+\.\d+[\w.\-]*)', _body)
-    if _m:
-        _ver = _m.group(1)
+    if len(_lines) >= 2:
+        _ver = _lines[1]
+        if _ver.startswith("v") or _ver.startswith("V"):
+            _ver = _ver[1:]
+    if not _ver:
+        _m = re.search(r'[vV]?(\d+\.\d+\.\d+[\w.\-]*)', _url)
+        if _m:
+            _ver = _m.group(1)
     if not _ver:
         return None
-    return _body, _ver
+    return _url, _ver
 
 
 def check_update_thread(silent):
-    """检查更新。silent=True 时不弹提示（启动静默检查）。"""
+    """检查更新。silent=True 时不弹提示（启动静默检查）。
+    逻辑：
+    1. 先获取 GitHub Release 最新版本 remote_ver；
+    2. 读取 link.txt 的直链和版本号 custom_ver；
+    3. 若 custom_ver >= remote_ver 且 custom_ver > 当前 ver，用直链更新；
+    4. 若 custom_ver < remote_ver，忽略直链，走 GitHub Release 更新；
+    5. GitHub 获取失败时回退到直链（若可用）。"""
     global update_popup
-    # 优先使用 link.txt 中配置的直链
-    _custom = _read_custom_update_url()
-    if _custom is not None:
-        _custom_url, _custom_ver = _custom
-        if compare_version(_custom_ver, ver) > 0:
-            with update_lock:
-                update_popup = {"type": "prompt", "version": _custom_ver,
-                                "current": ver, "zip_url": _custom_url}
-            return
+    # 1) 先获取 GitHub Release 最新版本
+    _gh_ok = False
+    _tag = None
+    _zip_url = None
     try:
-        tag, zip_url = _github_latest_release()
+        _tag, _zip_url = _github_latest_release()
+        _gh_ok = True
     except Exception as e:
         if not silent:
             with update_lock:
                 update_popup = {"type": "check_fail", "msg": f"检查更新失败：{e}"}
+    remote_ver = _strip_v(_tag) if (_gh_ok and _tag) else ""
+    # 2) 读取 link.txt
+    _custom = _read_custom_update_url()
+    if _custom is not None:
+        _custom_url, _custom_ver = _custom
+        _should_use_custom = False
+        if _gh_ok and remote_ver:
+            if compare_version(_custom_ver, remote_ver) >= 0:
+                _should_use_custom = True
+        else:
+            _should_use_custom = True
+        if _should_use_custom and compare_version(_custom_ver, ver) > 0:
+            with update_lock:
+                update_popup = {"type": "prompt", "version": _custom_ver,
+                                "current": ver, "zip_url": _custom_url}
+            return
+    # 3) GitHub 获取失败且直链不可用，直接返回
+    if not _gh_ok:
         return
-    remote_ver = _strip_v(tag)
     if not remote_ver:
         if not silent:
             with update_lock:
                 update_popup = {"type": "check_fail", "msg": "未获取到版本号"}
         return
-    if not zip_url:
+    if not _zip_url:
         if not silent:
             with update_lock:
                 update_popup = {"type": "check_fail", "msg": "Release 中没有找到 zip 文件"}
         return
     if compare_version(remote_ver, ver) > 0:
         with update_lock:
-            update_popup = {"type": "prompt", "version": remote_ver, "current": ver, "zip_url": zip_url}
+            update_popup = {"type": "prompt", "version": remote_ver, "current": ver, "zip_url": _zip_url}
     else:
         if not silent:
             with update_lock:

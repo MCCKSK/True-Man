@@ -5898,6 +5898,25 @@ def check_update_thread(silent):
                 update_popup = {"type": "check_fail", "msg": f"已是最新版本 {ver}"}
 
 
+def _get_game_exe_path():
+    """获取真实的游戏 exe 路径。
+    EnigmaVB 打包后 sys.executable 可能指向临时解压目录，
+    优先从 ENIGMA_VBOX_ORIGINAL_EXE 环境变量或 sys.argv[0] 获取原始路径。"""
+    if not getattr(sys, "frozen", False):
+        return os.path.abspath(__file__)
+    _candidates = []
+    _ev = os.environ.get("ENIGMA_VBOX_ORIGINAL_EXE", "")
+    if _ev:
+        _candidates.append(_ev)
+    if sys.argv:
+        _candidates.append(sys.argv[0])
+    _candidates.append(sys.executable)
+    for _c in _candidates:
+        if _c and os.path.isfile(_c) and _c.lower().endswith(".exe"):
+            return os.path.abspath(_c)
+    return sys.executable
+
+
 def download_and_apply_thread(zip_url, new_version=None):
     """下载 zip -> 解压到临时目录 -> 写 bat -> 启动 bat -> 通知主循环退出。"""
     global update_popup, update_pending_zip_url, update_ready_to_exit, update_download_progress, update_pending_version
@@ -5909,8 +5928,9 @@ def download_and_apply_thread(zip_url, new_version=None):
         return
     try:
         import time
-        game_dir = os.path.dirname(os.path.abspath(sys.executable))
-        exe_name = os.path.basename(sys.executable)
+        _game_exe = _get_game_exe_path()
+        game_dir = os.path.dirname(_game_exe)
+        exe_name = os.path.basename(_game_exe)
         temp_dir = tempfile.mkdtemp(prefix="trueman_update_")
         zip_path = os.path.join(temp_dir, "update.zip")
         
@@ -6031,33 +6051,53 @@ def download_and_apply_thread(zip_url, new_version=None):
                 if _f.lower().endswith(".exe"):
                     exe_name = _f
                     break
-        parent_dir = os.path.dirname(game_dir)
-        old_folder_name = os.path.basename(game_dir)
         if not new_version:
             new_version = "latest"
-        new_folder_name = f"TrueMan-v{new_version}"
-        new_game_dir = os.path.join(parent_dir, new_folder_name)
         bat_path = os.path.join(temp_dir, "update.bat")
+        # 计算新旧文件夹路径，用于更新后改名
+        _parent_dir = os.path.dirname(game_dir)
+        _old_folder_name = os.path.basename(game_dir)
+        _new_folder_name = f"TrueMan-v{new_version}"
+        _new_game_dir = os.path.join(_parent_dir, _new_folder_name)
+        # 安全检查：不要把桌面或用户主目录本身重命名
+        _abs_desktop = os.path.abspath(os.path.join(os.path.expanduser("~"), "Desktop"))
+        _abs_home = os.path.abspath(os.path.expanduser("~"))
+        _do_rename = (
+            _old_folder_name != _new_folder_name
+            and os.path.abspath(game_dir) not in (_abs_desktop, _abs_home)
+        )
         with open(bat_path, "w", encoding="gbk", errors="replace") as f:
             f.write("@echo off\n")
             f.write("chcp 936 >nul\n")
+            # 先离开游戏目录，否则重命名当前工作目录会失败
+            f.write('cd /d "%TEMP%"\n')
             f.write("timeout /t 3 /nobreak >nul\n")
-            f.write(f'cd /d "{parent_dir}"\n')
-            f.write(f'if not "{old_folder_name}" == "{new_folder_name}" (\n')
-            f.write(f'    if exist "{new_folder_name}" rd /s /q "{new_folder_name}" 2>nul\n')
-            f.write(f'    ren "{old_folder_name}" "{new_folder_name}"\n')
-            f.write(f')\n')
             f.write(f':retry_del\n')
-            f.write(f'if exist "{new_game_dir}" rd /s /q "{new_game_dir}" 2>nul\n')
-            f.write(f'if exist "{new_game_dir}" (timeout /t 2 /nobreak >nul & goto retry_del)\n')
-            f.write(f'mkdir "{new_game_dir}"\n')
-            f.write(f'cd /d "{new_game_dir}"\n')
-            f.write(f':retry_copy\n')
-            f.write(f'xcopy /e /y /i /q "{source_dir}\\*" "{new_game_dir}\\" >nul\n')
-            f.write(f'if errorlevel 1 (timeout /t 2 /nobreak >nul & goto retry_copy)\n')
-            f.write(f'if exist "{os.path.join(new_game_dir, exe_name)}" (\n')
-            f.write(f'    start "" /D "{new_game_dir}" "{exe_name}"\n')
-            f.write(f')\n')
+            f.write(f'del /f /q "{_game_exe}" 2>nul\n')
+            f.write(f'if exist "{_game_exe}" (timeout /t 2 /nobreak >nul & goto retry_del)\n')
+            f.write(f'xcopy /e /y /i /q "{source_dir}\\*" "{game_dir}\\" >nul\n')
+            if _do_rename:
+                f.write(f'if exist "{_new_game_dir}" rd /s /q "{_new_game_dir}" 2>nul\n')
+                f.write('set /a RENAME_RETRY=0\n')
+                f.write(':try_rename\n')
+                f.write(f'move /y "{game_dir}" "{_new_game_dir}" >nul 2>&1\n')
+                f.write(f'if exist "{_new_game_dir}\\{exe_name}" goto rename_ok\n')
+                f.write('set /a RENAME_RETRY+=1\n')
+                f.write('if %RENAME_RETRY% GEQ 10 goto rename_fail\n')
+                f.write('timeout /t 1 /nobreak >nul\n')
+                f.write('goto try_rename\n')
+                f.write(':rename_ok\n')
+                f.write(f'start "" /D "{_new_game_dir}" "{exe_name}"\n')
+                f.write('goto rename_end\n')
+                f.write(':rename_fail\n')
+                f.write(f'if exist "{game_dir}\\{exe_name}" (\n')
+                f.write(f'    start "" /D "{game_dir}" "{exe_name}"\n')
+                f.write(f')\n')
+                f.write(':rename_end\n')
+            else:
+                f.write(f'if exist "{_game_exe}" (\n')
+                f.write(f'    start "" /D "{game_dir}" "{exe_name}"\n')
+                f.write(f')\n')
             f.write(f'del /f /q "{zip_path}" 2>nul\n')
             f.write(f'rd /s /q "{extract_dir}" 2>nul\n')
         _flags = 0x08000000 if os.name == "nt" else 0

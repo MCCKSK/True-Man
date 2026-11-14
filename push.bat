@@ -1,6 +1,6 @@
 @echo off
-set /p text=±¸×¢£º
+set /p msg=Commit message: 
 git add .
-git commit -m "%text%"
+git commit -m "%msg%"
 git push
 pause

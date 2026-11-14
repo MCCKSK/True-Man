@@ -117,10 +117,18 @@ def compare_version(v1, v2):
             return -1
     if s1 == s2:
         return 0
+    # 无后缀（正式版）永远最大，前面的 if not s1/not s2 已经处理
     if not s1:
         return 1
     if not s2:
         return -1
+    # 已知后缀显式权重：alpha < beta < rc
+    # 未知后缀（如 gamma）默认权重 10，保证高于已知预览版，但低于无后缀
+    _weights = {"alpha": 1, "beta": 2, "rc": 3}
+    _w1 = _weights.get(s1, 10)
+    _w2 = _weights.get(s2, 10)
+    if _w1 != _w2:
+        return 1 if _w1 > _w2 else -1
     return 1 if s1 > s2 else -1
 
 pygame.display.set_caption(f"TrueMan {ver}")
@@ -5054,6 +5062,23 @@ update_lock = threading.Lock()
 update_popup = None
 update_pending_zip_url = None
 update_ready_to_exit = False
+# 下载进度：{"downloaded": int, "total": int|None, "phase": "download"|"apply"}
+update_download_progress = None
+
+
+def _fmt_size(n):
+    """把字节数格式化成便于阅读的字符串。"""
+    try:
+        n = float(n)
+    except Exception:
+        return "?"
+    if n < 1024:
+        return f"{int(n)} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n / (1024 * 1024):.2f} MB"
+    return f"{n / (1024 * 1024 * 1024):.2f} GB"
 
 
 def _github_latest_release():
@@ -5114,7 +5139,7 @@ def check_update_thread(silent):
 
 def download_and_apply_thread(zip_url):
     """下载 zip -> 解压到临时目录 -> 写 bat -> 启动 bat -> 通知主循环退出。"""
-    global update_popup, update_pending_zip_url, update_ready_to_exit
+    global update_popup, update_pending_zip_url, update_ready_to_exit, update_download_progress
     update_pending_zip_url = zip_url
     if not getattr(sys, "frozen", False):
         with update_lock:
@@ -5125,9 +5150,110 @@ def download_and_apply_thread(zip_url):
         exe_name = os.path.basename(sys.executable)
         temp_dir = tempfile.mkdtemp(prefix="trueman_update_")
         zip_path = os.path.join(temp_dir, "update.zip")
-        req = urllib.request.Request(zip_url, headers={"User-Agent": "TrueMan-Updater"})
-        with urllib.request.urlopen(req, timeout=120) as r, open(zip_path, "wb") as f:
-            shutil.copyfileobj(r, f)
+        # 纯 Python 多代理镜像下载，自动校验 ZIP 完整性，杜绝下载到网页源码
+        import time
+        _proxies = [
+            "", # 原链接
+            "https://ghproxy.net/",
+            "https://ghfast.top/",
+            "https://gh.llkk.cc/",
+            "https://gh-proxy.com/",
+            "https://github.moeyy.xyz/",
+        ]
+        _urls_to_try = []
+        _clean_url = zip_url.replace("https://github.com/", "")
+        for _p in _proxies:
+            _urls_to_try.append(_p + zip_url)
+            if _p:
+                _urls_to_try.append(_p + _clean_url)
+        _urls_to_try = list(dict.fromkeys(_urls_to_try))
+        
+        _success = False
+        _last_err = ""
+        for _try_url in _urls_to_try:
+            _domain = _try_url.split('/')[2] if '/' in _try_url else '直连'
+            with update_lock:
+                update_download_progress = {"phase": "download", "note": f"尝试节点: {_domain}..."}
+            try:
+                _req = urllib.request.Request(_try_url, headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "*/*"
+                })
+                # 将超时设为 30 秒，防止网络波动（如瞬断 5-10 秒）导致频繁切换节点
+                with urllib.request.urlopen(_req, timeout=30) as r:
+                    _total = int(r.headers.get("Content-Length") or 0)
+                    if _total <= 0:
+                        _total = None
+                    _downloaded = 0
+                    _start_t = time.time()
+                    _history = []
+                    with open(zip_path, "wb") as f:
+                        while True:
+                            _chunk = r.read(65536)
+                            if not _chunk:
+                                break
+                            f.write(_chunk)
+                            _downloaded += len(_chunk)
+                            _now = time.time()
+                            _history.append((_now, _downloaded))
+                            while _history and _now - _history[0][0] > 2.0:
+                                _history.pop(0)
+                            
+                            if len(_history) > 1 and _history[-1][0] - _history[0][0] > 0.1:
+                                _delta_t = _history[-1][0] - _history[0][0]
+                                _delta_b = _history[-1][1] - _history[0][1]
+                                _speed_bps = _delta_b / _delta_t
+                            else:
+                                _elapsed_s = _now - _start_t
+                                _speed_bps = _downloaded / _elapsed_s if _elapsed_s > 0 else 0
+                            
+                            if _speed_bps <= 0:
+                                _speed_bps = 1
+                                
+                            _spd_str = _fmt_size(_speed_bps) + "/s"
+                            if _total and _speed_bps > 0:
+                                _pct = int(_downloaded * 100 / _total)
+                                _eta_s = int((_total - _downloaded) / _speed_bps)
+                                _eta_str = f"{_eta_s // 60:02d}:{_eta_s % 60:02d}"
+                            else:
+                                _pct = None
+                                _eta_str = "--:--"
+                            with update_lock:
+                                update_download_progress = {
+                                    "phase": "download",
+                                    "percentage": _pct,
+                                    "speed": _spd_str,
+                                    "eta": _eta_str,
+                                    "downloaded": _downloaded,
+                                    "total": _total
+                                }
+                    # 检查是否发生了截断
+                    if _total and _downloaded < _total:
+                        raise RuntimeError("下载提前中断，文件不完整")
+                    # 核心校验：确认文件是合法的 ZIP 格式，否则说明节点返回了错误网页
+                    if not zipfile.is_zipfile(zip_path):
+                        raise RuntimeError("下载的内容不是合法的ZIP（节点可能已失效）")
+                    
+                    _success = True
+                    break
+            except Exception as e:
+                _last_err = str(e)
+                # 清理下载失败的残损文件，准备用下一个节点重试
+                if os.path.exists(zip_path):
+                    try:
+                        os.remove(zip_path)
+                    except Exception:
+                        pass
+                continue
+        if not _success:
+            raise RuntimeError(f"所有节点均下载失败。最后错误: {_last_err[:100]}")
+        # gh-download 下载后文件在 temp_dir/update.zip
+        _downloaded_path = os.path.join(temp_dir, "update.zip")
+        if not os.path.exists(_downloaded_path):
+            raise RuntimeError(f"下载完成但找不到文件: {_downloaded_path}")
+        zip_path = _downloaded_path
+        with update_lock:
+            update_download_progress = {"phase": "apply"}
         extract_dir = os.path.join(temp_dir, "extract")
         os.makedirs(extract_dir, exist_ok=True)
         with zipfile.ZipFile(zip_path, "r") as z:
@@ -5181,6 +5307,7 @@ def _draw_update_popup(mouse_pos):
     """绘制自动更新弹窗（覆盖在最上层）。"""
     with update_lock:
         popup = update_popup
+        _prog = update_download_progress
     if popup is None:
         return
     _ov = pygame.Surface((W, H), pygame.SRCALPHA)
@@ -5223,12 +5350,67 @@ def _draw_update_popup(mouse_pos):
         _draw_popup_button("重试", btn_l, mouse_pos)
         _draw_popup_button("取消", btn_r, mouse_pos)
     elif ptype == "downloading":
-        bordered_text("正在下载更新...", (W // 2, box_y + box_h // 2 - 20), "center", size=28)
-        bordered_text("下载完成后程序会自动重启，请勿关闭窗口", (W // 2, box_y + box_h // 2 + 25), "center", size=16)
+        if _prog is None:
+            bordered_text("正在下载更新...", (W // 2, box_y + box_h // 2 - 20), "center", size=28)
+            bordered_text("下载完成后程序会自动重启，请勿关闭窗口", (W // 2, box_y + box_h // 2 + 25), "center", size=16)
+        elif _prog.get("phase") == "apply":
+            bordered_text("正在安装更新...", (W // 2, box_y + box_h // 2 - 20), "center", size=28)
+            bordered_text("程序即将自动重启，请勿关闭窗口", (W // 2, box_y + box_h // 2 + 20), "center", size=16)
+        elif _prog.get("note"):
+            bordered_text(_prog["note"], (W // 2, box_y + box_h // 2 - 10), "center", size=22)
+            bordered_text("多镜像并行下载，速度取决于当前可用镜像", (W // 2, box_y + box_h // 2 + 30), "center", size=14)
+        elif _prog.get("percentage") is not None:
+            _pct = _prog["percentage"]
+            _bar_x = box_x + 50
+            _bar_y = box_y + box_h // 2
+            _bar_w = box_w - 100
+            _bar_h = 22
+            pygame.draw.rect(screen, (30, 30, 40), (_bar_x, _bar_y, _bar_w, _bar_h))
+            pygame.draw.rect(screen, (200, 200, 200), (_bar_x, _bar_y, _bar_w, _bar_h), 2)
+            _ratio = max(0.0, min(1.0, _pct / 100.0))
+            _fill_w = int((_bar_w - 4) * _ratio)
+            if _fill_w > 0:
+                pygame.draw.rect(screen, (60, 180, 90), (_bar_x + 2, _bar_y + 2, _fill_w, _bar_h - 4))
+            
+            _speed = _prog.get("speed", "")
+            _eta = _prog.get("eta", "")
+            _text = f"{_pct}%   速度: {_speed}   剩余: {_eta}"
+            bordered_text(_text, (W // 2, _bar_y - 28), "center", size=18)
+            bordered_text("程序即将自动重启，请勿关闭窗口",
+                          (W // 2, _bar_y + _bar_h + 24), "center", size=14)
+        else:
+            _dl = int(_prog.get("downloaded", 0))
+            _tt = _prog.get("total")
+            _bar_x = box_x + 50
+            _bar_y = box_y + box_h // 2
+            _bar_w = box_w - 100
+            _bar_h = 22
+            pygame.draw.rect(screen, (30, 30, 40), (_bar_x, _bar_y, _bar_w, _bar_h))
+            pygame.draw.rect(screen, (200, 200, 200), (_bar_x, _bar_y, _bar_w, _bar_h), 2)
+            if _tt and _tt > 0:
+                _ratio = max(0.0, min(1.0, _dl / float(_tt)))
+                _fill_w = int((_bar_w - 4) * _ratio)
+                if _fill_w > 0:
+                    pygame.draw.rect(screen, (60, 180, 90),
+                                     (_bar_x + 2, _bar_y + 2, _fill_w, _bar_h - 4))
+                bordered_text(f"{_ratio * 100:.1f}%   {_fmt_size(_dl)} / {_fmt_size(_tt)}",
+                              (W // 2, _bar_y - 28), "center", size=18)
+            else:
+                # 没有 Content-Length：画滚动条纹，避免看起来卡死
+                _tick = ui_frame_count % 40
+                _stripe_w = 40
+                _sx = _bar_x + (_tick * (_bar_w + _stripe_w) // 40) - _stripe_w
+                _clip = pygame.Rect(_bar_x + 2, _bar_y + 2, _bar_w - 4, _bar_h - 4)
+                screen.set_clip(_clip)
+                pygame.draw.rect(screen, (60, 180, 90), (_sx, _bar_y + 2, _stripe_w, _bar_h - 4))
+                screen.set_clip(None)
+                bordered_text(f"已下载 {_fmt_size(_dl)}", (W // 2, _bar_y - 28), "center", size=18)
+            bordered_text("下载完成后程序会自动重启，请勿关闭窗口",
+                          (W // 2, _bar_y + _bar_h + 24), "center", size=14)
 
 
 def _handle_update_popup_event(mouse_pos, event):
-    global update_popup
+    global update_popup, update_download_progress
     if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
         return
     with update_lock:
@@ -5245,6 +5427,7 @@ def _handle_update_popup_event(mouse_pos, event):
         if btn_l.collidepoint(mouse_pos):
             with update_lock:
                 update_popup = {"type": "downloading"}
+                update_download_progress = None
             threading.Thread(target=download_and_apply_thread,
                              args=(popup["zip_url"],), daemon=True).start()
         elif btn_r.collidepoint(mouse_pos):
@@ -5259,6 +5442,7 @@ def _handle_update_popup_event(mouse_pos, event):
             elif update_pending_zip_url:
                 with update_lock:
                     update_popup = {"type": "downloading"}
+                    update_download_progress = None
                 threading.Thread(target=download_and_apply_thread,
                                  args=(update_pending_zip_url,), daemon=True).start()
         elif btn_r.collidepoint(mouse_pos):
